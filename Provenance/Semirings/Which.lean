@@ -1,6 +1,25 @@
 import Provenance.SemiringWithMonus
+import Provenance.Semirings.BoolFunc
 import Mathlib.Data.Finset.Basic
 import Mathlib.Data.Finset.Lattice.Basic
+
+/-!
+# Which-provenance m-semiring (lineage)
+
+This file defines the *Which* (or lineage) provenance semiring `Which α`.
+Elements are either a finite set `wset s` representing the witnesses or `wbot`
+(bottom). Addition takes the union of witness sets, and multiplication does likewise.
+
+`Which α` is idempotent. It is absorptive if and only if `α` is empty. It does
+**not** satisfy left-distributivity of multiplication over monus when `α` is nonempty.
+
+The lineage semiring is discussed in
+[Green & Tannen, *The Semiring Framework for Database Provenance*][green2017provenance].
+
+## References
+
+* [Green & Tannen, *The Semiring Framework for Database Provenance*][green2017provenance]
+-/
 
 section Which
 
@@ -208,6 +227,19 @@ instance : SemiringWithMonus (Which α) where
     . rename_i sb
       by_cases h' : sa ⊆ sb <;> simp[h']
 
+  /- δ matches the identity. -/
+  delta := id
+  delta_zero := rfl
+  delta_natCast_pos :=
+    let hidem : idempotent (Which α) := fun a => by
+      simp [(· + ·), Add.add]
+      cases ha: a <;> simp
+    fun hn => delta_natCast_pos_id hidem hn
+  delta_regrouping := delta_regrouping_id
+
+instance : CommSemiringWithMonus (Which α) where
+  mul_comm := mul_comm
+
 
 /-- Which[X] is not absorptive as long as there is at least one variable -/
 theorem Which.not_absorptive (h: ∃ (_: α), ⊤) : ¬(absorptive (Which α)) := by
@@ -237,6 +269,15 @@ theorem Which.idempotent : idempotent (Which α) := by
   simp[(· + ·), Add.add]
   cases ha: a <;> simp
 
+instance : Nontrivial (Which α) := ⟨0, 1, by
+  intro (h : wbot = wset ∅)
+  cases h⟩
+
+/-- `Which α` has characteristic 0 in the `CharP` sense: it is idempotent and
+nontrivial (`wbot ≠ wset ∅`), so every positive natural-number cast equals `1`. -/
+instance Which.instCharPZero : CharP (Which α) 0 :=
+  CharP.zero_of_idempotent Which.idempotent
+
 /-- In Which[X], as long as X is non-empty, times is not distributive over
   monus. -/
 theorem Which.not_mul_sub_left_distributive [Inhabited α] :
@@ -245,3 +286,12 @@ theorem Which.not_mul_sub_left_distributive [Inhabited α] :
   have x := (default: α)
   use wset {x}, wset {x}, wset ∅
   simp[(· * ·),Mul.mul,(· - ·),Sub.sub]
+
+/-- There is no semiring homomorphism from `BoolFunc Y` to `Which α` (with `α`
+inhabited) sending the variables to arbitrary values: `Which α` is not
+absorptive (`Which.not_absorptive`), which contradicts `var i + 1 = 1` in
+`BoolFunc Y`. -/
+theorem Which.no_hom_from_BoolFunc {Y : Type} [Inhabited Y] [Inhabited α] :
+    ∃ ν : Y → Which α,
+      ¬ ∃ φ : BoolFunc Y →+* Which α, ∀ i : Y, φ (BoolFunc.var i) = ν i :=
+  BoolFunc.no_hom_of_not_absorptive (Which.not_absorptive ⟨default, trivial⟩)

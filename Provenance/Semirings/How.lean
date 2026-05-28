@@ -3,7 +3,32 @@ import Mathlib.Algebra.MvPolynomial.Eval
 import Mathlib.Data.Finsupp.ToDFinsupp
 
 import Provenance.SemiringWithMonus
+import Provenance.Semirings.BoolFunc
 import Provenance.Semirings.Nat
+
+/-!
+# How-provenance m-semiring `ℕ[X]`
+
+This file shows that the polynomial semiring `MvPolynomial X ℕ` (multivariate
+polynomials with natural-number coefficients over a set `X` of variables) is a
+commutative m-semiring, sometimes called the *How* provenance semiring.
+
+It is the universal commutative semiring for provenance
+[Green, Karnouvarakis & Tannen, *Provenance Semirings*, Proposition 4.2][green2007provenance],
+but is **not** the universal m-semiring
+[Geerts & Poggi, *On database query languages for K-relations*, Example 10][geerts2010database].
+
+`ℕ[X]` is neither idempotent nor absorptive. It also does **not** satisfy
+left-distributivity of multiplication over monus, contradicting a claim in
+[Amsterdamer, Deutch & Tannen, *On the limitations of provenance for queries with
+differences*, Table on p. 4][amsterdamer2011limitations].
+
+## References
+
+* [Green, Karnouvarakis & Tannen, *Provenance Semirings*][green2007provenance]
+* [Geerts & Poggi, *On database query languages for K-relations*][geerts2010database]
+* [Amsterdamer, Deutch & Tannen, *On the limitations of provenance for queries with differences*][amsterdamer2011limitations]
+-/
 
 variable {X: Type} [DecidableEq X]
 
@@ -64,9 +89,29 @@ instance : CanonicallyOrderedAdd (MvPolynomial X ℕ) where
     exact le_add_of_nonneg_left (by simp)
 
 
+/-- `ℕ[X]` inherits `CharZero` from `ℕ`: the constant embedding `C : ℕ → MvPolynomial X ℕ`
+is injective, and `(n : MvPolynomial X ℕ) = C n`. (Equivalent to
+`Mathlib.RingTheory.MvPolynomial.Basic.instCharZero`, inlined here to avoid the heavy
+transitive imports of that file.) -/
+instance : CharZero (MvPolynomial X ℕ) where
+  cast_injective x y hxy := by
+    rwa [← MvPolynomial.C_eq_coe_nat, ← MvPolynomial.C_eq_coe_nat,
+         MvPolynomial.C_inj, Nat.cast_inj] at hxy
+
+/-- the support indicator. -/
+private noncomputable def How.deltaInd (p : MvPolynomial X ℕ) : MvPolynomial X ℕ :=
+  if p = 0 then 0 else 1
+
+private theorem How.deltaInd_isIndicator : IsDeltaIndicator (How.deltaInd (X := X)) where
+  zero := by simp [How.deltaInd]
+  nonzero := fun a ha => by simp [How.deltaInd, ha]
+
 /-- Marked as noncomputable only because the proof that `MvPolynomial` is a
 `CommutativeSemiring` is done in a non-computable way in Mathlib. We
-could redefine `MvPolynomial` to provide computable proofs. -/
+could redefine `MvPolynomial` to provide computable proofs.
+
+The δ operator matches the support indicator
+(`0 ↦ 0`, any non-zero polynomial ↦ `1`). -/
 noncomputable instance : SemiringWithMonus (MvPolynomial X ℕ) where
   monus_spec := by
     intro a b c
@@ -75,20 +120,28 @@ noncomputable instance : SemiringWithMonus (MvPolynomial X ℕ) where
       exact Nat.sub_le_iff_le_add'.mp (h m)
     . intro h m
       exact Nat.sub_le_iff_le_add'.mpr (h m)
+  delta := How.deltaInd
+  delta_zero := How.deltaInd_isIndicator.zero
+  delta_natCast_pos := delta_natCast_pos_indicator How.deltaInd_isIndicator
+  delta_regrouping := delta_regrouping_indicator How.deltaInd_isIndicator
 
+noncomputable instance : CommSemiringWithMonus (MvPolynomial X ℕ) where
+  mul_comm := mul_comm
+
+omit [DecidableEq X] in
 theorem How.not_idempotent : ¬(idempotent (MvPolynomial X ℕ)) := by
   simp
   use (MvPolynomial.C 1)
-  rw[← MvPolynomial.C_add]
-  rw[MvPolynomial.C_inj _ _]
   simp
 
+omit [DecidableEq X] in
 theorem How.not_absorptive : ¬(absorptive (MvPolynomial X ℕ)) := by
   have h₁ := @idempotent_of_absorptive (MvPolynomial X ℕ) _
   have h₂ : ¬(idempotent (MvPolynomial X ℕ)) := How.not_idempotent
   tauto
 
 
+omit [DecidableEq X] in
 /-- The How[X] semiring is universal among commutative semirings. This
   was observed in [Green, Karnouvarakis, Tannen, *Provenance
   Semirings*, Proposition 4.2][green2007provenance]. -/
@@ -169,3 +222,18 @@ theorem How.not_mul_sub_left_distributive [Inhabited X]:
     have : MvPolynomial.coeff (Finsupp.single x 1) 1 = 0 := by
       simp[MvPolynomial.coeff_one,eq_comm]
     simp[this] at hm
+
+omit [DecidableEq X] in
+/-- `ℕ[X]` has characteristic 0 in the `CharP` sense, inherited from `CharZero` via
+`CharP.ofCharZero`. -/
+theorem How.charP_zero : CharP (MvPolynomial X ℕ) 0 := inferInstance
+
+omit [DecidableEq X] in
+/-- There is no semiring homomorphism from `BoolFunc Y` to `ℕ[X]` sending the
+variables to arbitrary values: `ℕ[X]` is not absorptive, which contradicts
+`var i + 1 = 1` in `BoolFunc Y`. -/
+theorem How.no_hom_from_BoolFunc {Y : Type} [Inhabited Y] :
+    ∃ ν : Y → MvPolynomial X ℕ,
+      ¬ ∃ φ : BoolFunc Y →+* MvPolynomial X ℕ,
+        ∀ i : Y, φ (BoolFunc.var i) = ν i :=
+  BoolFunc.no_hom_of_not_absorptive How.not_absorptive

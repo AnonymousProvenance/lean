@@ -1,9 +1,30 @@
 import Provenance.SemiringWithMonus
+import Provenance.Semirings.BoolFunc
 import Mathlib.Order.Interval.Set.Defs
 import Mathlib.Data.Rat.Init
 import Mathlib.Algebra.Order.Ring.Rat
 import Mathlib.Tactic.Ring.RingNF
 
+/-!
+# Łukasiewicz m-semiring
+
+This file defines the *Łukasiewicz* (fuzzy logic) semiring over rationals `[0,1]`.
+Addition is `max`, multiplication is the Łukasiewicz t-norm `max(a + b - 1, 0)`,
+zero is `0`, and one is `1`.
+
+The Łukasiewicz semiring is absorptive and idempotent, and satisfies left-distributivity
+of multiplication over monus.
+
+This semiring is discussed as a provenance semiring in
+[Grädel & Tannen, *Provenance Analysis and Semiring Semantics for First-Order Logic*][gradel2005provenance].
+
+## References
+
+* [Grädel & Tannen, *Provenance Analysis and Semiring Semantics for First-Order Logic*][gradel2005provenance]
+-/
+
+/-- The Łukasiewicz semiring: rationals in `[0,1]` with `max` as addition and the
+Łukasiewicz t-norm `max(a + b - 1, 0)` as multiplication. -/
 abbrev Lukasiewicz := {q : ℚ // 0 ≤ q ∧ q ≤ 1}
 
 instance : Zero Lukasiewicz where
@@ -262,6 +283,33 @@ instance : CanonicallyOrderedAdd Lukasiewicz where
     intro a b
     simp[(· + ·), Add.add]
 
+instance : Nontrivial Lukasiewicz :=
+  ⟨0, 1, fun h => zero_ne_one (Subtype.ext_iff.mp h)⟩
+
+theorem Lukasiewicz.absorptive : absorptive Lukasiewicz := by
+  intro a
+  simp[(· + ·), Add.add]
+  exact a.property.2
+
+theorem Lukasiewicz.idempotent : idempotent Lukasiewicz :=
+  idempotent_of_absorptive (Lukasiewicz.absorptive)
+
+/-- `Lukasiewicz` has characteristic 0 in the `CharP` sense: it is idempotent and
+nontrivial, so every positive natural-number cast equals `1`. -/
+instance Lukasiewicz.instCharPZero : CharP Lukasiewicz 0 :=
+  CharP.zero_of_idempotent Lukasiewicz.idempotent
+
+/-- the support indicator. -/
+private def Lukasiewicz.deltaInd (a : Lukasiewicz) : Lukasiewicz :=
+  if a = 0 then 0 else 1
+
+private theorem Lukasiewicz.deltaInd_isIndicator : IsDeltaIndicator Lukasiewicz.deltaInd where
+  zero := by simp [Lukasiewicz.deltaInd]
+  nonzero := fun a ha => by simp [Lukasiewicz.deltaInd, ha]
+
+/-- `Lukasiewicz` is a commutative m-semiring. The natural order is the usual rational
+order, and the monus is `a` if `a > b`, `0` if `a ≤ b`. The δ operator matches's
+`Lukasiewicz::delta`: the support indicator. -/
 instance : SemiringWithMonus Lukasiewicz where
   monus_spec := by
     intro a b c
@@ -280,14 +328,40 @@ instance : SemiringWithMonus Lukasiewicz where
         exact c.property.1
       . simp[hab] at h
         by_cases hbc: b ≤ c <;> simp[hab] <;> exact h
+  delta := Lukasiewicz.deltaInd
+  delta_zero := Lukasiewicz.deltaInd_isIndicator.zero
+  delta_natCast_pos := delta_natCast_pos_indicator Lukasiewicz.deltaInd_isIndicator
+  delta_regrouping := delta_regrouping_indicator Lukasiewicz.deltaInd_isIndicator
 
-theorem Lukasiewicz.absorptive : absorptive Lukasiewicz := by
-  intro a
-  simp[(· + ·), Add.add]
-  exact a.property.2
+instance : CommSemiringWithMonus Lukasiewicz where
+  mul_comm := mul_comm
 
-theorem Lukasiewicz.idempotent : idempotent Lukasiewicz :=
-  idempotent_of_absorptive (Lukasiewicz.absorptive)
+/-- Łukasiewicz multiplication is not idempotent: `(1/2) * (1/2) = max(0, 0) = 0 ≠ 1/2`. -/
+theorem Lukasiewicz.not_mul_idempotent : ¬ ∀ a : Lukasiewicz, a * a = a := by
+  push Not
+  have h0 : (0 : ℚ) ≤ (1 : ℚ) / 2 := by
+    rw [le_div_iff₀ (by norm_num : (0 : ℚ) < 2)]; norm_num
+  have h1 : (1 : ℚ) / 2 ≤ 1 := by
+    rw [div_le_iff₀ (by norm_num : (0 : ℚ) < 2)]; norm_num
+  refine ⟨⟨(1 : ℚ) / 2, ⟨h0, h1⟩⟩, ?_⟩
+  intro h
+  have h' := congrArg Subtype.val h
+  simp [(· * ·), Mul.mul] at h'
+  have hmax : max ((2 : ℚ)⁻¹ + (2 : ℚ)⁻¹ - 1) 0 = 0 :=
+    max_eq_right (by norm_num)
+  rw [hmax] at h'
+  have hpos : (0 : ℚ) < (2 : ℚ)⁻¹ := by
+    rw [inv_pos]; norm_num
+  exact hpos.ne h'
+
+/-- There is no semiring homomorphism from `BoolFunc Y` to the Łukasiewicz
+semiring sending the variables to arbitrary values: Łukasiewicz multiplication
+is not idempotent (`(1/2) ⊗ (1/2) = 0 ≠ 1/2`), contradicting
+`var i * var i = var i` in `BoolFunc Y`. -/
+theorem Lukasiewicz.no_hom_from_BoolFunc {Y : Type} [Inhabited Y] :
+    ∃ ν : Y → Lukasiewicz,
+      ¬ ∃ φ : BoolFunc Y →+* Lukasiewicz, ∀ i : Y, φ (BoolFunc.var i) = ν i :=
+  BoolFunc.no_hom_of_not_mul_idem Lukasiewicz.not_mul_idempotent
 
 theorem Lukasiewicz.mul_sub_left_distributive :
   mul_sub_left_distributive Lukasiewicz := by

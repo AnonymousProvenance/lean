@@ -1,4 +1,22 @@
 import Provenance.SemiringWithMonus
+import Provenance.Semirings.BoolFunc
+
+/-!
+# Why-provenance m-semiring `Why[X]`
+
+This file defines the *Why* provenance semiring `Why α = Set (Set α)`.
+Elements are sets of subsets of `α` (representing sets of witnesses). Addition
+is union of families, and multiplication is pairwise union of witnesses.
+
+`Why α` is idempotent but **not** absorptive when `α` is nonempty. It also
+does **not** satisfy left-distributivity of multiplication over monus, contradicting
+a claim in [Amsterdamer, Deutch & Tannen, *On the limitations of provenance for
+queries with differences*, Table on p. 4][amsterdamer2011limitations].
+
+## References
+
+* [Amsterdamer, Deutch & Tannen, *On the limitations of provenance for queries with differences*][amsterdamer2011limitations]
+-/
 
 @[ext]
 structure Why (α: Type) where
@@ -194,18 +212,8 @@ instance : SemiringWithMonus (Why α) where
     use ⟨b.carrier \ a.carrier⟩
     ext x
     simp
-    apply Iff.intro
-    . intro hx
-      by_cases h: x ∈ a.carrier
-      . left
-        assumption
-      . right
-        constructor <;> assumption
-    . intro hx
-      by_cases h: x ∈ a.carrier
-      . exact hab h
-      . simp[h] at hx
-        assumption
+    intro hx
+    exact hab hx
 
   le_self_add := by
     intro a b x hx
@@ -239,9 +247,31 @@ instance : SemiringWithMonus (Why α) where
       simp at h'
       tauto
 
+  /- δ matches identity on `Why α` (the C++ form
+  `x.empty() ? zero() : x` collapses to the identity since `zero = ⟨∅⟩`). -/
+  delta := id
+  delta_zero := rfl
+  delta_natCast_pos :=
+    let hidem : idempotent (Why α) := fun a => by simp [(· + ·), Add.add]
+    fun hn => delta_natCast_pos_id hidem hn
+  delta_regrouping := delta_regrouping_id
+
+instance : CommSemiringWithMonus (Why α) where
+  mul_comm := mul_comm
+
 theorem Why.idempotent : idempotent (Why α) := by
   intro a
   simp[(· + ·), Add.add]
+
+instance : Nontrivial (Why α) := ⟨0, 1, fun h => by
+  have h' : (⟨∅⟩ : Why α) = ⟨{∅}⟩ := h
+  injection h' with h''
+  exact Set.singleton_ne_empty _ h''.symm⟩
+
+/-- `Why α` has characteristic 0 in the `CharP` sense: it is idempotent and
+nontrivial (`⟨∅⟩ ≠ ⟨{∅}⟩`), so every positive natural-number cast equals `1`. -/
+instance Why.instCharPZero : CharP (Why α) 0 :=
+  CharP.zero_of_idempotent Why.idempotent
 
 theorem Why.not_absorptive (hNotEmpty: ∃ (_: α), ⊤) : ¬(absorptive (Why α)) := by
   rcases hNotEmpty with ⟨x, _⟩
@@ -268,4 +298,73 @@ theorem Why.not_mul_sub_left_distributive [Inhabited α] :
   have x := (default: α)
   use ⟨{{x}}⟩, ⟨{∅}⟩, ⟨{{x}}⟩
   simp[(· * ·),Mul.mul,why_mul,(· - ·),Sub.sub]
-  simp[Set.diff_eq]
+
+/-- There is no semiring homomorphism from `BoolFunc Y` to `Why α` (with `α`
+inhabited) sending the variables to arbitrary values: `Why α` is not
+absorptive (`Why.not_absorptive`), which contradicts `var i + 1 = 1` in
+`BoolFunc Y`. -/
+theorem Why.no_hom_from_BoolFunc {Y : Type} [Inhabited Y] [Inhabited α] :
+    ∃ ν : Y → Why α,
+      ¬ ∃ φ : BoolFunc Y →+* Why α, ∀ i : Y, φ (BoolFunc.var i) = ν i :=
+  BoolFunc.no_hom_of_not_absorptive (Why.not_absorptive ⟨default, trivial⟩)
+
+/-- The two natural expansions of `HAVING (count = 2)` for a three-tuple
+group, `(t₁ ⊗ t₂) ⊗ (𝟙 ⊖ t₃) ⊕ (t₁ ⊗ t₃) ⊗ (𝟙 ⊖ t₂) ⊕ (t₂ ⊗ t₃) ⊗ (𝟙 ⊖ t₁)`
+and `(t₁ ⊗ t₂) ⊕ (t₁ ⊗ t₃) ⊕ (t₂ ⊗ t₃)`, are inequivalent in `Why[X]`.
+With `t₁ = ⟨{{0}}⟩`, `t₂ = ⟨{{1}}⟩`, `t₃ = ⟨{∅}⟩ = 𝟙` over `X = Fin 2`, the
+first expression has carrier `{{0}, {1}}` while the second has the strictly
+larger carrier `{{0, 1}, {0}, {1}}`. The witness set `{0, 1}` separates
+them. -/
+theorem Why.counterexample_having :
+    ∃ t₁ t₂ t₃ : Why (Fin 2),
+      (t₁ * t₂) * (1 - t₃) + (t₁ * t₃) * (1 - t₂) + (t₂ * t₃) * (1 - t₁)
+        ≠ t₁ * t₂ + t₁ * t₃ + t₂ * t₃ := by
+  refine ⟨⟨{{0}}⟩, ⟨{{1}}⟩, ⟨{∅}⟩, ?_⟩
+  intro h
+  -- `{0, 1}` lies in the RHS carrier via the `t₁ * t₂` summand …
+  have h01_eq : ({0, 1} : Set (Fin 2)) = ({0} : Set (Fin 2)) ∪ ({1} : Set (Fin 2)) :=
+    (Set.singleton_union).symm
+  have hRHS : ({0, 1} : Set (Fin 2)) ∈
+      ((⟨{{0}}⟩ * ⟨{{1}}⟩ + ⟨{{0}}⟩ * ⟨{∅}⟩ + ⟨{{1}}⟩ * ⟨{∅}⟩ : Why (Fin 2))).carrier := by
+    show ({0, 1} : Set (Fin 2)) ∈
+        (why_mul ⟨{{0}}⟩ ⟨{{1}}⟩).carrier ∪
+          (why_mul ⟨{{0}}⟩ ⟨{∅}⟩).carrier ∪
+            (why_mul ⟨{{1}}⟩ ⟨{∅}⟩).carrier
+    refine Or.inl (Or.inl ⟨{0}, {1}, ?_, ?_, h01_eq⟩)
+    · change ({0} : Set (Fin 2)) ∈ ({{0}} : Set (Set (Fin 2))); simp
+    · change ({1} : Set (Fin 2)) ∈ ({{1}} : Set (Set (Fin 2))); simp
+  -- … but it is absent from the LHS, by case analysis on the three summands.
+  have hcarr := congrArg Why.carrier h
+  rw [← hcarr] at hRHS
+  rcases hRHS with hRHS | hRHS
+  · rcases hRHS with hRHS | hRHS
+    · -- First summand: `(1 - t₃).carrier = ({∅} \ {∅}) = ∅`, impossible.
+      obtain ⟨_, y, _, hy, _⟩ := hRHS
+      change y ∈ ({∅} \ {∅} : Set (Set (Fin 2))) at hy
+      simp at hy
+    · -- Second summand: `(t₁ * t₃) * (1 - t₂)` has carrier `{{0}}`.
+      obtain ⟨x, y, hx, hy, hxy⟩ := hRHS
+      obtain ⟨a, b, ha, hb, hab⟩ := hx
+      have hy_eq : y = (∅ : Set (Fin 2)) := hy.1
+      change a ∈ ({{0}} : Set (Set (Fin 2))) at ha
+      change b ∈ ({∅} : Set (Set (Fin 2))) at hb
+      simp at ha hb
+      subst ha; subst hb; subst hy_eq
+      have hx_eq : x = ({0} : Set (Fin 2)) := by rw [hab]; ext n; simp
+      have hbad : ({0, 1} : Set (Fin 2)) = ({0} : Set (Fin 2)) := by
+        rw [hxy, hx_eq]; ext n; simp
+      have h1mem : (1 : Fin 2) ∈ ({0, 1} : Set (Fin 2)) := by simp
+      rw [hbad] at h1mem; simp at h1mem
+  · -- Third summand: `(t₂ * t₃) * (1 - t₁)` has carrier `{{1}}`.
+    obtain ⟨x, y, hx, hy, hxy⟩ := hRHS
+    obtain ⟨a, b, ha, hb, hab⟩ := hx
+    have hy_eq : y = (∅ : Set (Fin 2)) := hy.1
+    change a ∈ ({{1}} : Set (Set (Fin 2))) at ha
+    change b ∈ ({∅} : Set (Set (Fin 2))) at hb
+    simp at ha hb
+    subst ha; subst hb; subst hy_eq
+    have hx_eq : x = ({1} : Set (Fin 2)) := by rw [hab]; ext n; simp
+    have hbad : ({0, 1} : Set (Fin 2)) = ({1} : Set (Fin 2)) := by
+      rw [hxy, hx_eq]; ext n; simp
+    have h0mem : (0 : Fin 2) ∈ ({0, 1} : Set (Fin 2)) := by simp
+    rw [hbad] at h0mem; simp at h0mem

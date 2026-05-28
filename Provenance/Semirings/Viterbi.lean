@@ -2,8 +2,26 @@ import Mathlib.Data.NNReal.Basic
 import Mathlib.Algebra.Order.Ring.Basic
 
 import Provenance.SemiringWithMonus
+import Provenance.Semirings.BoolFunc
 
 open scoped Classical
+
+/-!
+# Viterbi m-semiring
+
+This file defines the *Viterbi* semiring over non-negative reals in `[0,1]`.
+Addition is `max`, multiplication is the usual product, zero is `0`, and one is `1`.
+
+The Viterbi semiring is absorptive and idempotent, and satisfies left-distributivity
+of multiplication over monus.
+
+This semiring is discussed in
+[Green & Tannen, *The Semiring Framework for Database Provenance*][green2017provenance].
+
+## References
+
+* [Green & Tannen, *The Semiring Framework for Database Provenance*][green2017provenance]
+-/
 
 /--
 Viterbi semiring (max-times) over probabilities in `[0,1]`.
@@ -92,90 +110,111 @@ instance : PartialOrder Viterbi where
     exact le_antisymm hab hba
 
 @[simp] theorem le_def (a b : Viterbi) :
-    a ≤ b ↔ (a: NNReal) ≤ (b: NNReal) := by simp
+    a ≤ b ↔ (a: NNReal) ≤ (b: NNReal) := Iff.rfl
 
-noncomputable
-instance : SemiringWithMonus Viterbi where
-  sub a b := if (a : NNReal) ≤ (b : NNReal) then 0 else a
-  lt a b := a + b = b ∧ a ≠ b
-  le := (· ≤ ·)
-  le_refl := le_refl
-  le_trans := by intro a b c; exact le_trans
-  le_antisymm := by intro a b; exact le_antisymm
+noncomputable instance : Sub Viterbi :=
+  ⟨fun a b => if (a : NNReal) ≤ (b : NNReal) then 0 else a⟩
 
-  lt_iff_le_not_ge := by
-    intro a b
-    constructor
-    · intro h
-      rcases h with ⟨hab, hne⟩
-      have hle : (a : NNReal) ≤ (b : NNReal) := (viterbi_order_le a b).2 hab
-      have hnot : ¬ (b : NNReal) ≤ (a : NNReal) := by
-        intro hba
-        exact hne (Subtype.ext (le_antisymm hle hba))
-      exact ⟨hle, hnot⟩
-    · intro h
-      rcases h with ⟨hle, hnot⟩
-      have hab : a + b = b := (viterbi_order_le a b).1 hle
-      have hne : a ≠ b := by
-        intro heq
-        apply hnot
-        simp [heq]
-      exact ⟨hab, hne⟩
-
+instance : IsOrderedAddMonoid Viterbi where
   add_le_add_left := by
     intro a b hab c
     simpa using max_le_max hab (le_rfl : (c : NNReal) ≤ c)
 
+instance : CanonicallyOrderedAdd Viterbi where
   exists_add_of_le := by
     intro a b hab
     refine ⟨b, ?_⟩
     symm
     exact (viterbi_order_le a b).1 hab
+  le_self_add := by intro a b; simp
+  le_add_self := by intro a b; simp
 
-  le_self_add := by
-    intro a b
-    simp
+instance instNontrivial : Nontrivial Viterbi :=
+  ⟨0, 1, fun h => zero_ne_one (Subtype.ext_iff.mp h)⟩
 
-  le_add_self := by
-    intro a b
-    simp
-
-  monus_spec := by
-    intro a b c
-    -- unfold the definition of `sub` and split on `a ≤ b`
-    simp[(· - ·), Sub.sub]
-    by_cases hab : (a : NNReal) ≤ (b : NNReal) <;> simp at hab
-    · simp [hab]
-      refine Subtype.coe_le_coe.mp ?_
-      simp
-    · have : ¬a≤b := by by_contra h; have := (lt_self_iff_false _).mp (lt_of_lt_of_le hab h); assumption
-      simp [this]
-
-theorem absorptive : absorptive Viterbi := by
-  intro a
-  ext
-  simp [a.property]
+theorem absorptive : absorptive Viterbi := by intro a; ext; simp [a.property]
 
 theorem idempotent : idempotent Viterbi := idempotent_of_absorptive absorptive
+
+/-- `Viterbi` has characteristic 0 in the `CharP` sense: it is idempotent and
+nontrivial. -/
+instance instCharPZero : CharP Viterbi 0 := CharP.zero_of_idempotent idempotent
+
+/-- the support indicator. -/
+private noncomputable def Viterbi.deltaInd (a : Viterbi) : Viterbi :=
+  if a = 0 then 0 else 1
+
+private theorem Viterbi.deltaInd_isIndicator : IsDeltaIndicator Viterbi.deltaInd where
+  zero := by simp [Viterbi.deltaInd]
+  nonzero := fun a ha => by simp [Viterbi.deltaInd, ha]
+
+/-- `Viterbi` is a commutative m-semiring. The natural order is the usual order on
+`[0,1]`, and the monus is `a` if `a > b`, `0` if `a ≤ b`. -/
+noncomputable
+instance : SemiringWithMonus Viterbi where
+  monus_spec := by
+    intro a b c
+    show (if (a : NNReal) ≤ (b : NNReal) then (0 : Viterbi) else a) ≤ c ↔
+         (a : NNReal) ≤ max (b : NNReal) (c : NNReal)
+    split_ifs with hab
+    · constructor
+      · intro _
+        exact le_max_of_le_left hab
+      · intro _
+        show (0 : NNReal) ≤ (c : NNReal)
+        simp
+    · refine ⟨fun h => le_max_of_le_right h, fun h => ?_⟩
+      rcases max_le_iff.mp (le_of_eq (rfl : max (b : NNReal) (c : NNReal) = _)) with _
+      rcases le_or_gt (a : NNReal) (c : NNReal) with hac | hac
+      · exact hac
+      · exfalso
+        have hab' : (a : NNReal) ≤ (b : NNReal) := by
+          rcases le_total (b : NNReal) (c : NNReal) with hbc | hbc
+          · rw [max_eq_right hbc] at h; exact absurd (lt_of_lt_of_le hac h) (lt_irrefl _)
+          · rw [max_eq_left hbc] at h; exact h
+        exact hab hab'
+  delta := Viterbi.deltaInd
+  delta_zero := Viterbi.deltaInd_isIndicator.zero
+  delta_natCast_pos := delta_natCast_pos_indicator Viterbi.deltaInd_isIndicator
+  delta_regrouping := delta_regrouping_indicator Viterbi.deltaInd_isIndicator
+
+noncomputable
+instance : CommSemiringWithMonus Viterbi where
+  mul_comm := mul_comm
+
+/-- Viterbi multiplication is not idempotent: `(1/2) * (1/2) = 1/4 ≠ 1/2`. -/
+theorem not_mul_idempotent : ¬ ∀ a : Viterbi, a * a = a := by
+  push Not
+  have hle : ((1 : NNReal) / 2) ≤ 1 := by
+    rw [div_le_iff₀ (by norm_num : (0 : NNReal) < 2)]; norm_num
+  refine ⟨⟨(1 : NNReal) / 2, hle⟩, ?_⟩
+  intro h
+  have h' : ((1 : NNReal) / 2) * ((1 : NNReal) / 2) = (1 : NNReal) / 2 :=
+    congrArg Subtype.val h
+  field_simp at h'
+  norm_num at h'
+
+/-- There is no semiring homomorphism from `BoolFunc Y` to `Viterbi` sending the
+variables to arbitrary values: Viterbi multiplication (ordinary product on
+`[0,1]`) is not idempotent, contradicting `var i * var i = var i` in
+`BoolFunc Y`. -/
+theorem no_hom_from_BoolFunc {Y : Type} [Inhabited Y] :
+    ∃ ν : Y → Viterbi,
+      ¬ ∃ φ : BoolFunc Y →+* Viterbi, ∀ i : Y, φ (BoolFunc.var i) = ν i :=
+  BoolFunc.no_hom_of_not_mul_idem not_mul_idempotent
 
 theorem mul_sub_left_distributive : mul_sub_left_distributive Viterbi := by
   intro a b c
   ext
-  simp [(· - ·), Sub.sub, mul_def]
-  by_cases hbc : (b : NNReal) ≤ (c : NNReal) <;> simp at hbc
-  · simp[hbc]
-    have habc : (a : NNReal) * (b : NNReal) ≤ (a : NNReal) * (c : NNReal) :=
-      @mul_le_mul_right Viterbi _ _ _ _ _ hbc (a: Viterbi)
-    simp [habc]
-  . have : ¬b≤c := by by_contra h; have := (lt_self_iff_false _).mp (lt_of_lt_of_le hbc h); assumption
-    simp[this]
-    by_cases ha0 : (a : NNReal) = 0
+  simp only [(· - ·), Sub.sub, mul_def]
+  split_ifs with hbc habc habc
+  · simp
+  · exfalso
+    exact habc (mul_le_mul_of_nonneg_left hbc (zero_le _))
+  · by_cases ha0 : (a : NNReal) = 0
     · simp [ha0]
-    · have hnot : ¬ (a : NNReal) * (b : NNReal) ≤ (a : NNReal) * (c : NNReal) := by
-        intro habc
-        have ha_pos : (0 : NNReal) < (a : NNReal) := lt_of_le_of_ne (by simp) (Ne.symm ha0)
-        have : (b : NNReal) ≤ (c : NNReal) := le_of_mul_le_mul_left habc ha_pos
-        exact (lt_self_iff_false _).mp (lt_of_le_of_lt this hbc)
-      simp [hnot]
+    · have ha_pos : (0 : NNReal) < (a : NNReal) := lt_of_le_of_ne (zero_le _) (Ne.symm ha0)
+      exact absurd (le_of_mul_le_mul_left habc ha_pos) hbc
+  · rfl
 
 end Viterbi
