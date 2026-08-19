@@ -2,6 +2,8 @@ import Lake
 open Lake DSL
 
 package "provenance" where
+  -- Keep this repository out of the Reservoir package index
+  reservoir := false
   -- Settings applied to both builds and interactive editing
   leanOptions := #[
     ⟨`pp.unicode.fun, true⟩, -- pretty-prints `fun a ↦ b`
