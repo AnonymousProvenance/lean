@@ -5,16 +5,22 @@ import Mathlib.Algebra.BigOperators.Ring.Finset
 import Mathlib.Algebra.Order.BigOperators.Group.Finset
 import Mathlib.Algebra.Order.BigOperators.Ring.Finset
 import Mathlib.Algebra.Order.Ring.Rat
-import Mathlib.Data.Fintype.BigOperators
 import Mathlib.Data.Fintype.Pi
-import Mathlib.Logic.Equiv.Prod
 import Mathlib.Tactic.Linarith
 
+import Provenance.QueryAnnotatedDatabase
+import Provenance.QueryAnnotatedDatabaseHom
+import Provenance.QueryRewriting
 import Provenance.Semirings.Bool
 import Provenance.Semirings.BoolFunc
 
 /-!
 # Probability distributions over Boolean variables
+
+This file defines the intensional probability semantics underlying
+probabilistic query evaluation in ProvSQL, following Section IV-D of
+[Sen et al., *ProvSQL: A General System for Keeping Track of
+the Provenance and Probability of Data*][sen2026provsql].
 
 Given a finite set `X` of Boolean variables and an assignment `Pr : X → ℚ`
 of probabilities (with values in `[0, 1]`), we extend `Pr` to:
@@ -24,9 +30,18 @@ of probabilities (with values in `[0, 1]`), we extend `Pr` to:
 * a probability of a Boolean function `f : BoolFunc X`, defined as the sum of
   `Pr(v)` over satisfying valuations: `Pr(f) = ∑_{v ⊨ f} Pr(v)`.
 
-We also develop the standard `BoolFunc.DependsOn` notion of support and prove
-the independence lemma `Pr(f * g) = Pr(f) · Pr(g)` when `f` and `g` depend on
-disjoint variable supports.
+This is the foundation for Theorem 12 of [Sen et al.][sen2026provsql]
+(intensional
+probabilistic query evaluation correctness), proved below as
+`ProbAssignment.theorem_12`: for any non-aggregation query `q`, any
+`BoolFunc X`-instance `Î` and any tuple `t`,
+`Pr(t ∈ q(Î)) = Pr(⋁_{(t,α) ∈ ⟪q⟫^Î} α)`. Its structural core is
+`randomWorld_evaluateAnnotated`, the commutation of annotated evaluation
+with random-world projection, which doubles as the adequacy theorem of the
+annotated semantics for the full non-aggregation fragment (difference and
+duplicate elimination included); see the section
+“The structural commutation theorem” below for how this relates to the
+`ℕ`-adequacy theorem of [benzaken2021coq].
 
 ## Main definitions
 
@@ -34,21 +49,25 @@ disjoint variable supports.
   with `0 ≤ Pr(x) ≤ 1`.
 * `ProbAssignment.valProb` – `Pr(v)` for a single valuation `v : X → Bool`.
 * `ProbAssignment.funcProb` – `Pr(f)` for a Boolean function `f : BoolFunc X`.
-* `BoolFunc.DependsOn` – `f` depends only on a `Finset` of variables.
 
 ## Main results
 
 * `ProbAssignment.valProb_nonneg`, `valProb_le_one`, `sum_valProb_eq_one` –
   basic properties of the valuation distribution.
 * `ProbAssignment.funcProb_zero`, `funcProb_one`, `funcProb_nonneg`,
-  `funcProb_le_one`, `funcProb_congr` – basic properties of `Pr(f)`.
-* `ProbAssignment.funcProb_var` – `Pr(var i) = Pr(i)`.
-* `ProbAssignment.funcProb_sub_self_const_one` – `Pr(1 - f) = 1 - Pr(f)`.
-* `ProbAssignment.funcProb_mul_disjoint` – the **independence lemma**:
-  `Pr(f * g) = Pr(f) * Pr(g)` whenever `f`, `g` depend on disjoint variable
-  supports.
-* `ProbAssignment.funcProb_add_eq` – inclusion-exclusion at OR:
-  `Pr(f + g) = Pr(f) + Pr(g) - Pr(f * g)`.
+  `funcProb_le_one` – basic properties of `Pr(f)`.
+* `ProbAssignment.funcProb_congr` – pointwise-equal Boolean functions have
+  equal probabilities.
+* `randomWorld_evaluateAnnotated` – annotated evaluation commutes with
+  random-world projection (adequacy of the `BoolFunc X`-annotated semantics).
+* `ProbAssignment.theorem_12`, `corollary_13` – correctness of intensional
+  probabilistic query evaluation, on the annotated and on the plain rewritten
+  query respectively.
+
+## References
+
+* [Sen et al.][sen2026provsql] (Section IV-D)
+* [Benzaken, Cohen-Boulakia, Contejean, Keller & Zucchini][benzaken2021coq]
 -/
 
 variable {X : Type} [Fintype X] [DecidableEq X]
@@ -190,286 +209,898 @@ theorem funcProb_eq_filter_sum (f : BoolFunc X) :
 
 end ProbAssignment
 
-/-! ### `BoolFunc.DependsOn`: support of a Boolean function -/
+/-- For finite `X`, equality of Boolean functions `(X → Bool) → Bool` is
+decidable in principle (since the function space is finite). We expose the
+classical decidability instance so that `Query.evaluateAnnotated`, which
+requires `[DecidableEq K]`, can be invoked for `K = BoolFunc X`. -/
+noncomputable instance instDecidableEqBoolFunc : DecidableEq (BoolFunc X) :=
+  Classical.decEq _
 
-/-- `f` depends only on the variables in `S`: any two valuations agreeing
-on `S` produce the same value. This is the standard notion of "support". -/
-def BoolFunc.DependsOn {X : Type} (f : BoolFunc X) (S : Finset X) : Prop :=
-  ∀ v₁ v₂ : X → Bool, (∀ x ∈ S, v₁ x = v₂ x) → f v₁ = f v₂
+/-- `Relation T n` is a `def` for `Multiset (Tuple T n)`, so the standard
+`Membership` instance does not propagate automatically. Re-expose it so that
+`t ∈ q.evaluate d` typechecks. (We deliberately do *not* use this instance
+inside the body of `randomWorld`, which returns a bare `Multiset` so that
+`Multiset.mem_map` rewrites apply cleanly.) -/
+instance instMembershipRelation {T : Type} {n : ℕ} :
+    Membership (Tuple T n) (Relation T n) :=
+  inferInstanceAs (Membership (Tuple T n) (Multiset (Tuple T n)))
 
-/-! ### Auxiliary `funcProb` lemmas -/
+/-- Decidability of `t ∈ q.evaluate d` (with `[ValueType T]`). -/
+instance instDecidableMemRelation {T : Type} [ValueType T] {n : ℕ}
+    (t : Tuple T n) (r : Relation T n) : Decidable (t ∈ r) :=
+  Multiset.decidableMem t r
+
+/-- Membership in `AnnotatedRelation` (a `def`-wrapped `Multiset`). -/
+instance instMembershipAnnotatedRelation {T K : Type} {n : ℕ} :
+    Membership (AnnotatedTuple T K n) (AnnotatedRelation T K n) :=
+  inferInstanceAs (Membership (AnnotatedTuple T K n) (Multiset (AnnotatedTuple T K n)))
+
+/-! ## Random worlds and the disjunctive tuple annotation
+
+We now move toward Theorem 12 of [Sen et al.][sen2026provsql]. Two pieces of
+infrastructure are
+needed: the **random world** of a `BoolFunc X`-annotated relation under a
+valuation `v : X → Bool` (the plain relation containing exactly the data
+parts of the annotated tuples whose annotation evaluates to `true` at `v`),
+and the **disjunctive tuple annotation** `⋁_{(t,α) ∈ r} α` (a single Boolean
+function summarizing all the ways `t` can appear in `r`). -/
+
+variable {T : Type} [ValueType T]
+
+/-- The disjunctive tuple annotation `tupleAnnotation r t = ⋁_{(t,α) ∈ r} α`:
+the OR over the annotations of all annotated tuples in `r` whose data part
+equals `t`. In the m-semiring `BoolFunc X`, multiset sum is pointwise OR, so
+this is exactly the disjunction [Sen et al.][sen2026provsql] write inside
+`Pr(·)` on the right-hand side of their Theorem 12. -/
+def tupleAnnotation (r : AnnotatedRelation T (BoolFunc X) n) (t : Tuple T n) :
+    BoolFunc X :=
+  (Multiset.map Prod.snd
+    (Multiset.filter (fun p : AnnotatedTuple T (BoolFunc X) n => p.fst = t) r)).sum
+
+/-- The random world of a `BoolFunc X`-annotated relation under a valuation
+`v`: the plain relation consisting of the data parts of the annotated tuples
+whose annotation evaluates to `true` at `v`. The return type is a bare
+`Multiset (Tuple T n)` (rather than `Relation T n`) so that `Multiset` lemmas
+apply without an extra unfolding step. -/
+def randomWorld (v : X → Bool) (r : AnnotatedRelation T (BoolFunc X) n) :
+    Multiset (Tuple T n) :=
+  Multiset.map Prod.fst
+    (Multiset.filter (fun p : AnnotatedTuple T (BoolFunc X) n => p.snd v = true) r)
+
+/-- Pointwise random world of a `BoolFunc X`-annotated database: each
+annotated relation is replaced by its plain random-world projection. -/
+def AnnotatedDatabase.randomWorld
+    (v : X → Bool) (Î : AnnotatedDatabase T (BoolFunc X)) : Database T :=
+  Î.map (fun e => (e.fst, ⟨e.snd.fst, _root_.randomWorld v e.snd.snd⟩))
+
+/-! ### Pointwise meaning of `tupleAnnotation`
+
+`(tupleAnnotation r t)(v) = true` iff some annotated tuple `(t, α) ∈ r` has
+`α(v) = true`. This is the connection between the disjunction-on-the-right
+of Theorem 12 and the random-world picture on the left. -/
+
+omit [Fintype X] [DecidableEq X] in
+/-- `Multiset.sum` of a multiset of `BoolFunc X` evaluated at `v` equals the
+sum (in `Bool`) of the pointwise evaluations: this just pushes evaluation at
+`v` through the additive monoid hom. -/
+private lemma boolFunc_multiset_sum_apply
+    (s : Multiset (BoolFunc X)) (v : X → Bool) :
+    s.sum v = (s.map (fun f => f v)).sum := by
+  induction s using Multiset.induction_on with
+  | empty => rfl
+  | cons f t ih =>
+    rw [Multiset.sum_cons, Multiset.map_cons, Multiset.sum_cons, ← ih]
+    rfl
+
+/-- A multiset sum in `Bool` (where `+` is OR) equals `true` iff some element
+of the multiset is `true`. -/
+private lemma bool_multiset_sum_eq_true (s : Multiset Bool) :
+    s.sum = true ↔ ∃ b ∈ s, b = true := by
+  induction s using Multiset.induction_on with
+  | empty => simp
+  | cons b t ih =>
+    rw [Multiset.sum_cons]
+    show (b + t.sum) = true ↔ ∃ b' ∈ b ::ₘ t, b' = true
+    constructor
+    · intro h
+      have : b = true ∨ t.sum = true := by
+        have hb : (b + t.sum) = (b || t.sum) := rfl
+        rw [hb, Bool.or_eq_true] at h
+        exact h
+      rcases this with hb | ht
+      · exact ⟨b, Multiset.mem_cons_self _ _, hb⟩
+      · obtain ⟨b', hb', heq⟩ := ih.mp ht
+        exact ⟨b', Multiset.mem_cons_of_mem hb', heq⟩
+    · rintro ⟨b', hb', heq⟩
+      rcases Multiset.mem_cons.mp hb' with rfl | hb''
+      · show (b' || t.sum) = true
+        rw [heq]; rfl
+      · have : t.sum = true := ih.mpr ⟨b', hb'', heq⟩
+        show (b || t.sum) = true
+        rw [this]; simp
+
+omit [Fintype X] [DecidableEq X] in
+/-- **Pointwise reading of `tupleAnnotation`.** `(tupleAnnotation r t)(v) = true`
+exactly when the random world at `v` of `r` contains `t`. -/
+theorem tupleAnnotation_apply_eq_true_iff
+    (r : AnnotatedRelation T (BoolFunc X) n) (t : Tuple T n) (v : X → Bool) :
+    (tupleAnnotation r t) v = true ↔ t ∈ randomWorld v r := by
+  unfold tupleAnnotation randomWorld
+  rw [boolFunc_multiset_sum_apply, bool_multiset_sum_eq_true]
+  constructor
+  · rintro ⟨b, hb_mem, hb_true⟩
+    -- b ∈ map (fun f => f v) (map snd (filter (·.fst = t) r)) and b = true
+    rw [Multiset.mem_map] at hb_mem
+    obtain ⟨α, hα_mem, hα_eq⟩ := hb_mem
+    rw [Multiset.mem_map] at hα_mem
+    obtain ⟨p, hp_mem, hp_snd⟩ := hα_mem
+    rw [Multiset.mem_filter] at hp_mem
+    -- hp_mem : p ∈ r ∧ p.fst = t
+    -- Goal: t ∈ map fst (filter (·.snd v = true) r)
+    rw [Multiset.mem_map]
+    refine ⟨p, ?_, hp_mem.2⟩
+    rw [Multiset.mem_filter]
+    refine ⟨hp_mem.1, ?_⟩
+    -- Need p.snd v = true. We have hp_snd : p.snd = α, hα_eq : α v = b, hb_true : b = true.
+    rw [hp_snd, hα_eq, hb_true]
+  · rintro hmem
+    rw [Multiset.mem_map] at hmem
+    obtain ⟨p, hp_mem, hp_fst⟩ := hmem
+    rw [Multiset.mem_filter] at hp_mem
+    -- hp_mem : p ∈ r ∧ p.snd v = true
+    refine ⟨p.snd v, ?_, hp_mem.2⟩
+    rw [Multiset.mem_map]
+    refine ⟨p.snd, ?_, rfl⟩
+    rw [Multiset.mem_map]
+    refine ⟨p, ?_, rfl⟩
+    rw [Multiset.mem_filter]
+    exact ⟨hp_mem.1, hp_fst⟩
+
+/-! ## Marginal probability and the statement of Theorem 12
+
+The marginal probability `Pr(t ∈ q(Î))` is defined as the sum over valuations
+`v` of `Pr(v)` indexed by whether `t` appears in `q.evaluate (Î.randomWorld v)`.
+This is the standard “intensional” definition: enumerate possible worlds,
+weight each by its probability, and accumulate the indicator that the query
+output contains `t`.
+
+[Sen et al.][sen2026provsql] write the same thing as
+`∑_J [t ∈ ⟦q⟧(J)] · Pr(J)` over
+sub-instances `J ⊆ Î`. The two sums agree because, for each valuation `v`,
+the unique `J` whose characteristic Boolean function `Φ_J(Î)` is satisfied at
+`v` is exactly `J(v) = { (u, α) ∈ Î | α(v) = true }`, whose data side is
+`Î.randomWorld v`. -/
 
 namespace ProbAssignment
 
 variable (P : ProbAssignment X)
 
-/-- `Pr(var i) = Pr(i)`: the probability of the single-variable Boolean function
-equals the variable's own probability. Proved by reorganising the sum
-`∑_v if v i then valProb v else 0` as a product `∏_y h_y(v y)` and applying
-`Fintype.prod_sum` (the same swap used in `sum_valProb_eq_one`). -/
-theorem funcProb_var (i : X) :
-    P.funcProb (BoolFunc.var i) = P.prob i := by
-  -- Local helper: factor at y, depending on v y.
-  -- For y = i: contributes `b ↦ if b then Pr(i) else 0` (kills the `v i = false` case).
-  -- For y ≠ i: contributes the usual `P̃_y(b)`.
-  let h : X → Bool → ℚ := fun y b =>
-    if y = i then (if b then P.prob i else 0)
-    else (if b then P.prob y else 1 - P.prob y)
-  -- The product ∏_y h y (v y) equals (if v i then valProb v else 0).
-  have hprod : ∀ v : X → Bool,
-      (∏ y, h y (v y)) = if (v i : Bool) then P.valProb v else 0 := by
-    intro v
-    by_cases hvi : v i = true
-    · -- v i = true: factor at i is P.prob i = P̃_i(true), so the product reduces to valProb v.
-      simp only [hvi, if_true]
-      unfold valProb
-      apply Finset.prod_congr rfl
-      intro y _
-      by_cases hy : y = i
-      · subst hy
-        simp only [h, if_pos rfl, hvi, if_true]
-      · simp only [h, if_neg hy]
-    · -- v i = false: factor at i is 0, so the product vanishes.
-      have hvi' : v i = false := by
-        cases hv : v i
-        · rfl
-        · exact absurd hv hvi
-      simp only [hvi']
-      apply Finset.prod_eq_zero (i := i) (Finset.mem_univ i)
-      simp only [h, if_pos rfl, hvi']
+/-- Marginal probability that the tuple `t` appears in the output of `q`
+when evaluated on a random world of `Î`. -/
+noncomputable def marginalProb
+    (q : Query T n) (Î : AnnotatedDatabase T (BoolFunc X)) (t : Tuple T n) : ℚ :=
+  ∑ v : X → Bool,
+    if t ∈ q.evaluate (Î.randomWorld v) then P.valProb v else 0
+
+end ProbAssignment
+
+/-! ### Random worlds commute with annotated query evaluation
+
+The structural heart of Theorem 12 is the following commutation: for any
+non-aggregation query `q`, taking the random world of the annotated query
+result gives the same multiset as evaluating `q` on the plain random-world
+database.
+
+```
+  randomWorld v (evaluateAnnotated q Î)  =  q.evaluate (Î.randomWorld v)
+```
+
+Once this holds, Theorem 12 follows by summing `Pr(v)` weighted by the
+matching indicators over `v`, using `tupleAnnotation_apply_eq_true_iff` on
+the right-hand side and the definition of `marginalProb` on the left. -/
+
+-- Make `Selection.eval`'s decidability available as an instance (by default it
+-- is a `@[reducible] def`), so that `Multiset.filter`-by-`φ.eval` inside the
+-- query semantics can match `Multiset.filter`-by-`φ.eval` inside our helpers.
+attribute [instance] Selection.evalDecidable Selection.evalDecidableAnnotated
+
+/-! ### Helper lemmas: random-world commutes with Multiset operations -/
+
+omit [Fintype X] [DecidableEq X] [ValueType T] in
+@[simp] lemma randomWorld_zero (v : X → Bool) :
+    randomWorld v (0 : AnnotatedRelation T (BoolFunc X) n) = 0 := rfl
+
+omit [Fintype X] [DecidableEq X] [ValueType T] in
+/-- `randomWorld` is additive on relations: filtering and projecting the
+data side commutes with multiset sum. -/
+lemma randomWorld_add (v : X → Bool)
+    (r₁ r₂ : AnnotatedRelation T (BoolFunc X) n) :
+    randomWorld v (r₁ + r₂) = randomWorld v r₁ + randomWorld v r₂ := by
+  unfold randomWorld
+  exact (congr_arg (Multiset.map Prod.fst)
+          (Multiset.filter_add (fun p : AnnotatedTuple T (BoolFunc X) n => p.snd v = true)
+            r₁ r₂)).trans
+    (Multiset.map_add _ _ _)
+
+omit [Fintype X] [DecidableEq X] [ValueType T] in
+/-- Filtering the data side commutes with `randomWorld v`. -/
+lemma randomWorld_filter_data (v : X → Bool)
+    (φ : Tuple T n → Prop) [DecidablePred φ]
+    (r : AnnotatedRelation T (BoolFunc X) n) :
+    Multiset.filter φ (randomWorld v r) =
+      randomWorld v (Multiset.filter (fun p : Tuple T n × BoolFunc X => φ p.fst) r) := by
+  let r' : Multiset (Tuple T n × BoolFunc X) := r
+  show Multiset.filter φ
+        (Multiset.map Prod.fst
+          (Multiset.filter (fun p : Tuple T n × BoolFunc X => p.snd v = true) r'))
+      = Multiset.map Prod.fst
+          (Multiset.filter (fun p : Tuple T n × BoolFunc X => p.snd v = true)
+            (Multiset.filter (fun p : Tuple T n × BoolFunc X => φ p.fst) r'))
+  induction r' using Multiset.induction_on with
+  | empty => rfl
+  | cons q s ih =>
+    by_cases hq : q.snd v = true
+    · by_cases hφ : φ q.fst
+      · -- both filters pos
+        rw [Multiset.filter_cons_of_pos
+              (p := fun p : Tuple T n × BoolFunc X => p.snd v = true) s hq,
+            Multiset.map_cons,
+            Multiset.filter_cons_of_pos (p := φ) _ hφ,
+            Multiset.filter_cons_of_pos
+              (p := fun p : Tuple T n × BoolFunc X => φ p.fst) s hφ,
+            Multiset.filter_cons_of_pos
+              (p := fun p : Tuple T n × BoolFunc X => p.snd v = true) _ hq,
+            Multiset.map_cons, ih]
+      · -- snd-filter pos, fst-filter neg
+        rw [Multiset.filter_cons_of_pos
+              (p := fun p : Tuple T n × BoolFunc X => p.snd v = true) s hq,
+            Multiset.map_cons,
+            Multiset.filter_cons_of_neg (p := φ) _ hφ,
+            Multiset.filter_cons_of_neg
+              (p := fun p : Tuple T n × BoolFunc X => φ p.fst) s hφ, ih]
+    · by_cases hφ : φ q.fst
+      · -- snd-filter neg, fst-filter pos
+        rw [Multiset.filter_cons_of_neg
+              (p := fun p : Tuple T n × BoolFunc X => p.snd v = true) s hq,
+            Multiset.filter_cons_of_pos
+              (p := fun p : Tuple T n × BoolFunc X => φ p.fst) s hφ,
+            Multiset.filter_cons_of_neg
+              (p := fun p : Tuple T n × BoolFunc X => p.snd v = true) _ hq, ih]
+      · rw [Multiset.filter_cons_of_neg
+              (p := fun p : Tuple T n × BoolFunc X => p.snd v = true) s hq,
+            Multiset.filter_cons_of_neg
+              (p := fun p : Tuple T n × BoolFunc X => φ p.fst) s hφ, ih]
+
+omit [Fintype X] [DecidableEq X] [ValueType T] in
+/-- Mapping the data side commutes with `randomWorld v`. Proved by
+`Multiset.induction_on`, with all `Multiset.filter` / `Multiset.map` lemmas
+called with named `(p := ...)` / explicit-type arguments so Lean's HOU does
+not pick a wrong decomposition and so the underlying `Lex`-unfolded carrier
+type matches between goal and rewrite. -/
+lemma randomWorld_map_data (v : X → Bool) (f : Tuple T n → Tuple T m)
+    (r : AnnotatedRelation T (BoolFunc X) n) :
+    Multiset.map f (randomWorld v r) =
+      randomWorld v (r.map (fun p : AnnotatedTuple T (BoolFunc X) n => (f p.fst, p.snd))) := by
+  -- Work with the underlying plain-`Prod` carrier so that all subterms agree
+  -- on the syntactic representation of the tuple type.
+  let r' : Multiset (Tuple T n × BoolFunc X) := r
+  show Multiset.map f
+        (Multiset.map Prod.fst
+          (Multiset.filter (fun p : Tuple T n × BoolFunc X => p.snd v = true) r'))
+      = Multiset.map Prod.fst
+          (Multiset.filter (fun p : Tuple T m × BoolFunc X => p.snd v = true)
+            (Multiset.map (fun p : Tuple T n × BoolFunc X => (f p.fst, p.snd)) r'))
+  induction r' using Multiset.induction_on with
+  | empty => rfl
+  | cons q s ih =>
+    by_cases hq : q.snd v = true
+    · have hq' : (f q.fst, q.snd).snd v = true := hq
+      rw [Multiset.map_cons (fun p : Tuple T n × BoolFunc X => (f p.fst, p.snd)) q s,
+          Multiset.filter_cons_of_pos
+            (p := fun p : Tuple T n × BoolFunc X => p.snd v = true) s hq,
+          Multiset.filter_cons_of_pos
+            (p := fun p : Tuple T m × BoolFunc X => p.snd v = true) _ hq',
+          Multiset.map_cons, Multiset.map_cons, Multiset.map_cons, ih]
+    · have hq' : ¬ (f q.fst, q.snd).snd v = true := hq
+      rw [Multiset.map_cons (fun p : Tuple T n × BoolFunc X => (f p.fst, p.snd)) q s,
+          Multiset.filter_cons_of_neg
+            (p := fun p : Tuple T n × BoolFunc X => p.snd v = true) s hq,
+          Multiset.filter_cons_of_neg
+            (p := fun p : Tuple T m × BoolFunc X => p.snd v = true) _ hq', ih]
+
+/-! ### Random world commutes with `find` -/
+
+omit [Fintype X] [DecidableEq X] [ValueType T] in
+lemma AnnotatedDatabase.find_randomWorld
+    (n : ℕ) (s : String) (Î : AnnotatedDatabase T (BoolFunc X)) (v : X → Bool) :
+    (Î.randomWorld v).find n s = (Î.find n s).map (_root_.randomWorld v) := by
+  induction Î with
+  | nil => rfl
+  | cons hd tl ih =>
+    unfold AnnotatedDatabase.randomWorld AnnotatedDatabase.find AnnotatedDatabase.find.f
+            Database.find Database.find.f
+    by_cases hcond : n = hd.snd.fst ∧ s = hd.fst
+    · simp [hcond]
+      have := hcond.left; subst this
       rfl
-  -- Per-variable sum: contributes `P.prob i` at `y = i`, and `1` elsewhere.
-  have hsum : ∀ y, (∑ b, h y b) = if y = i then P.prob i else 1 := by
-    intro y
-    by_cases hy : y = i
-    · subst hy
-      simp only [h, if_pos rfl]
-      have hu : (Finset.univ : Finset Bool) = {false, true} := by decide
-      rw [hu, Finset.sum_insert (by decide : (false : Bool) ∉ ({true} : Finset Bool)),
-          Finset.sum_singleton]
-      simp
-    · simp only [h, if_neg hy]
-      have hu : (Finset.univ : Finset Bool) = {false, true} := by decide
-      rw [hu, Finset.sum_insert (by decide : (false : Bool) ∉ ({true} : Finset Bool)),
-          Finset.sum_singleton]
-      simp
-  -- Apply Fintype.prod_sum (∏∑ = ∑∏) in reverse.
-  have hswap : (∑ v : X → Bool, ∏ y, h y (v y)) = ∏ y, ∑ b, h y b :=
-    (Fintype.prod_sum h).symm
-  -- Goal: rewrite funcProb's sum to match.
-  show (∑ v : X → Bool, if (BoolFunc.var i v : Bool) then P.valProb v else 0) = P.prob i
-  have hvar : ∀ v : X → Bool, BoolFunc.var i v = v i := fun _ => rfl
-  have hstep1 : (∑ v : X → Bool, if (BoolFunc.var i v : Bool) then P.valProb v else 0)
-              = ∑ v : X → Bool, ∏ y, h y (v y) := by
-    apply Finset.sum_congr rfl
-    intro v _
-    rw [hvar v, ← hprod v]
-  rw [hstep1, hswap]
-  -- Now: ∏ y, ∑ b, h y b = P.prob i
-  have hstep2 : (∏ y, ∑ b, h y b) = ∏ y, if y = i then P.prob i else (1 : ℚ) := by
-    apply Finset.prod_congr rfl
-    intro y _
-    exact hsum y
-  rw [hstep2]
-  rw [Finset.prod_ite_eq' Finset.univ i (fun _ => P.prob i)]
-  simp
+    · simp [hcond]
+      unfold AnnotatedDatabase.randomWorld AnnotatedDatabase.find at ih
+      exact ih
 
-/-- `Pr(¬f) = 1 - Pr(f)`: probability of a Boolean complement. In `BoolFunc X`,
-`1 - f` is pointwise `f v && !(f v)`-style Boolean subtraction, which on the
-constant-true `1` reduces to `Bool.not ∘ f`. The proof splits each summand by
-`f v` and uses `sum_valProb_eq_one`. -/
-theorem funcProb_sub_self_const_one (f : BoolFunc X) :
-    P.funcProb (1 - f) = 1 - P.funcProb f := by
-  unfold funcProb
-  -- Rewrite each `(1 - f) v` to `!(f v)` and split the sum by cases on `f v`.
-  have hsub : ∀ v : X → Bool, (1 - f : BoolFunc X) v = !(f v) := by
-    intro v
-    show ((1 : BoolFunc X) v && !(f v) : Bool) = !(f v)
-    have h1 : (1 : BoolFunc X) v = true := rfl
-    rw [h1]; simp
-  have hstep :
-      (∑ v : X → Bool, if ((1 - f : BoolFunc X) v : Bool) then P.valProb v else 0)
-      = ∑ v : X → Bool, (P.valProb v - (if (f v : Bool) then P.valProb v else 0)) := by
-    apply Finset.sum_congr rfl
-    intro v _
-    rw [hsub v]
-    by_cases hfv : f v = true
-    · simp [hfv]
-    · have hfv' : f v = false := by
-        cases h : f v with
-        | false => rfl
-        | true => exact absurd h hfv
-      simp [hfv']
-  rw [hstep, Finset.sum_sub_distrib, P.sum_valProb_eq_one]
+/-! ### Diff annotation helper
 
-/-! ### Independence lemma
+For the `Diff` case of the structural commutation theorem we need to
+characterize when the annotation subtracted from `r₁`'s entries evaluates to
+`false` at the valuation `v`: this happens exactly when the data tuple is
+not in the random world of `r₂`. -/
 
-The independence lemma `funcProb_mul_disjoint` is the technical heart of the
-read-once correctness theorem: `Pr(f * g) = Pr(f) * Pr(g)` whenever `f` and `g`
-depend on disjoint variable supports. The proof splits each valuation
-`v : X → Bool` into its restrictions on `S` and `Sᶜ` via
-`Equiv.piEquivPiSubtypeProd`, factors the valuation probability over the
-partition, and uses the marginalisation `∑_b (P̃_x b) = 1` to discard the
-unused half on each of the two factors. -/
+omit [Fintype X] [DecidableEq X] in
+/-- The `Diff` subtraction-annotation evaluates to `false` at `v` iff the
+data tuple is absent from the random world of the subtracted relation. -/
+lemma diff_annotation_eq_false_iff
+    (v : X → Bool) (r₂ : AnnotatedRelation T (BoolFunc X) n) (u : Tuple T n) :
+    ((((groupByKey r₂).val.find?
+        (fun q : Tuple T n × BoolFunc X => q.1 = u)).map Prod.snd).getD 0 : BoolFunc X) v = false
+      ↔ u ∉ randomWorld v r₂ := by
+  -- Bridge: u ∉ rw v r₂ iff no annotated tuple p ∈ r₂ with p.fst = u has p.snd v = true.
+  have hnotin_iff : u ∉ randomWorld v r₂
+      ↔ ∀ p : AnnotatedTuple T (BoolFunc X) n, p ∈ r₂
+          → ¬ (p.fst = u ∧ p.snd v = true) := by
+    unfold randomWorld
+    constructor
+    · intro h p hp ⟨hfst, hsnd⟩
+      apply h
+      rw [Multiset.mem_map]
+      refine ⟨p, ?_, hfst⟩
+      rw [Multiset.mem_filter]
+      exact ⟨hp, hsnd⟩
+    · intro h hmem
+      rw [Multiset.mem_map] at hmem
+      obtain ⟨p, hp, hpfst⟩ := hmem
+      rw [Multiset.mem_filter] at hp
+      exact h p hp.1 ⟨hpfst, hp.2⟩
+  cases h_find : (groupByKey r₂).val.find?
+        (fun q : Tuple T n × BoolFunc X => q.1 = u) with
+  | none =>
+    simp only [Option.map_none, Option.getD_none]
+    rw [show (0 : BoolFunc X) v = false from rfl]
+    rw [hnotin_iff]
+    rw [List.find?_eq_none] at h_find
+    refine ⟨?_, ?_⟩
+    · intro _ p hp ⟨hfst, _⟩
+      have hu_mem : u ∈ Multiset.map Prod.fst r₂ := by
+        rw [Multiset.mem_map]; exact ⟨p, hp, hfst⟩
+      obtain ⟨w, hw⟩ := (groupByKey_key_iff r₂ u).mpr hu_mem
+      exact h_find _ hw (by simp)
+    · intro _; rfl
+  | some uw =>
+    obtain ⟨u', w⟩ := uw
+    have hu' : u' = u := by
+      have := List.find?_some h_find; simp at this; exact this
+    -- Substitute the find?-returned key with u everywhere.
+    rw [hu'] at h_find
+    have hw_in : (u, w) ∈ (groupByKey r₂).val := List.mem_of_find?_eq_some h_find
+    have hw_val : w = (Multiset.map Prod.snd
+          (Multiset.filter (fun q : AnnotatedTuple T (BoolFunc X) n ↦ q.fst = u) r₂)).sum :=
+      groupByKey_value r₂ u w hw_in
+    show (((Option.map Prod.snd _).getD 0) : BoolFunc X) v = false ↔ u ∉ randomWorld v r₂
+    rw [hu', Option.map_some, Option.getD_some]
+    -- The `(u, ...).2` projects to the sum; reduce, then apply
+    -- `boolFunc_multiset_sum_apply`.
+    show w v = false ↔ u ∉ randomWorld v r₂
+    rw [hw_val, boolFunc_multiset_sum_apply, hnotin_iff]
+    refine ⟨?_, ?_⟩
+    · intro hw_v p hp ⟨hfst, hsnd⟩
+      have htrue_in : true ∈ Multiset.map (fun f : BoolFunc X => f v)
+          (Multiset.map Prod.snd (Multiset.filter
+            (fun q : AnnotatedTuple T (BoolFunc X) n => q.fst = u) r₂)) := by
+        rw [Multiset.mem_map]
+        refine ⟨p.snd, ?_, hsnd⟩
+        rw [Multiset.mem_map]
+        refine ⟨p, ?_, rfl⟩
+        rw [Multiset.mem_filter]; exact ⟨hp, hfst⟩
+      have hsum : (Multiset.map (fun f : BoolFunc X => f v)
+          (Multiset.map Prod.snd (Multiset.filter
+            (fun q : AnnotatedTuple T (BoolFunc X) n => q.fst = u) r₂))).sum = true := by
+        rw [bool_multiset_sum_eq_true]
+        exact ⟨true, htrue_in, rfl⟩
+      rw [hsum] at hw_v
+      exact Bool.false_ne_true hw_v.symm
+    · intro hall
+      have hall_false : ∀ b ∈ Multiset.map (fun f : BoolFunc X => f v)
+          (Multiset.map Prod.snd (Multiset.filter
+            (fun q : AnnotatedTuple T (BoolFunc X) n => q.fst = u) r₂)),
+          b = false := by
+        intro b hb
+        rw [Multiset.mem_map] at hb
+        obtain ⟨α, hα_in, hα_eq⟩ := hb
+        rw [Multiset.mem_map] at hα_in
+        obtain ⟨p, hp_in, hp_snd⟩ := hα_in
+        rw [Multiset.mem_filter] at hp_in
+        obtain ⟨hp_r, hp_fst⟩ := hp_in
+        rw [← hα_eq, ← hp_snd]
+        cases h : p.snd v
+        · rfl
+        · exfalso; exact hall p hp_r ⟨hp_fst, h⟩
+      have hne_true : (Multiset.map (fun f : BoolFunc X => f v)
+          (Multiset.map Prod.snd (Multiset.filter
+            (fun q : AnnotatedTuple T (BoolFunc X) n => q.fst = u) r₂))).sum ≠ true := by
+        intro h
+        rw [bool_multiset_sum_eq_true] at h
+        obtain ⟨b, hb_in, hb_true⟩ := h
+        rw [hall_false b hb_in] at hb_true
+        exact Bool.false_ne_true hb_true
+      cases h : (Multiset.map (fun f : BoolFunc X => f v)
+          (Multiset.map Prod.snd (Multiset.filter
+            (fun q : AnnotatedTuple T (BoolFunc X) n => q.fst = u) r₂))).sum
+      · rfl
+      · exact absurd h hne_true
 
-/-- **Independence lemma.** If `f`, `g : BoolFunc X` depend on disjoint
-variable supports `S`, `T`, then `Pr(f * g) = Pr(f) * Pr(g)`.
+/-! ### The structural commutation theorem
 
-The proof splits each valuation `v : X → Bool` into `(v|S, v|Sᶜ)` via
-`Equiv.piEquivPiSubtypeProd`, factors `valProb v` as the product of the two
-restricted products, and uses the marginalisations
-`∑_{vS} (∏_{x ∈ S} P̃_x(vS x)) = 1` and
-`∑_{vR} (∏_{x ∉ S} P̃_x(vR x)) = 1`
-(both proved via `Fintype.prod_sum` and `sum_factor_at`) to collapse the
-unused half on each side. -/
-theorem funcProb_mul_disjoint {f g : BoolFunc X} {S T : Finset X}
-    (hf : f.DependsOn S) (hg : g.DependsOn T) (hST : Disjoint S T) :
-    P.funcProb (f * g) = P.funcProb f * P.funcProb g := by
-  classical
-  -- Per-variable factor.
-  let h : X → Bool → ℚ := fun x b => if b then P.prob x else 1 - P.prob x
-  -- Equivalence splitting valuations along S.
-  let e : (X → Bool) ≃ ({x // x ∈ S} → Bool) × ({x // x ∉ S} → Bool) :=
-    Equiv.piEquivPiSubtypeProd (fun x => x ∈ S) _
-  -- Glue helper: stitch a Subtype-pair valuation back to a full one.
-  let glue : ({x // x ∈ S} → Bool) → ({x // x ∉ S} → Bool) → (X → Bool) :=
-    fun vS vR => e.symm (vS, vR)
-  -- Default fillers (used to define `fS` and `gR`).
-  let v0R : {x // x ∉ S} → Bool := fun _ => false
-  let v0S : {x // x ∈ S} → Bool := fun _ => false
-  -- "Restricted" Boolean functions on each half.
-  let fS : ({x // x ∈ S} → Bool) → Bool := fun vS => f (glue vS v0R)
-  let gR : ({x // x ∉ S} → Bool) → Bool := fun vR => g (glue v0S vR)
-  -- Per-side probability products.
-  let pS : ({x // x ∈ S} → Bool) → ℚ := fun vS => ∏ x : {x // x ∈ S}, h ↑x (vS x)
-  let pR : ({x // x ∉ S} → Bool) → ℚ := fun vR => ∏ x : {x // x ∉ S}, h ↑x (vR x)
-  -- Glue evaluates to vS on S and vR on Sᶜ.
-  have hglue_in : ∀ vS vR (x : X) (hx : x ∈ S), glue vS vR x = vS ⟨x, hx⟩ := by
-    intro vS vR x hx
-    show (e.symm (vS, vR)) x = vS ⟨x, hx⟩
-    simp [e, Equiv.piEquivPiSubtypeProd, hx]
-  have hglue_out : ∀ vS vR (x : X) (hx : x ∉ S), glue vS vR x = vR ⟨x, hx⟩ := by
-    intro vS vR x hx
-    show (e.symm (vS, vR)) x = vR ⟨x, hx⟩
-    simp [e, Equiv.piEquivPiSubtypeProd, hx]
-  -- f depends only on the S-half of the valuation.
-  have hfeq : ∀ vS vR, f (glue vS vR) = fS vS := fun vS vR =>
-    hf _ _ fun x hxS => by rw [hglue_in _ _ _ hxS, hglue_in _ _ _ hxS]
-  -- g depends only on the Sᶜ-half of the valuation (since T ⊆ Sᶜ).
-  have hgeq : ∀ vS vR, g (glue vS vR) = gR vR := fun vS vR =>
-    hg _ _ fun x hxT => by
-      have hxnS : x ∉ S := Finset.disjoint_right.mp hST hxT
-      rw [hglue_out _ _ _ hxnS, hglue_out _ _ _ hxnS]
-  -- Valuation probability factors along the partition.
-  have hval_split : ∀ vS vR, P.valProb (glue vS vR) = pS vS * pR vR := by
-    intro vS vR
-    show (∏ x, h x ((glue vS vR) x))
-          = (∏ x : {x // x ∈ S}, h ↑x (vS x)) * (∏ x : {x // x ∉ S}, h ↑x (vR x))
-    rw [← Finset.prod_mul_prod_compl S (fun x => h x ((glue vS vR) x))]
-    congr 1
-    · rw [Finset.prod_subtype (s := S) (p := fun x => x ∈ S) (fun _ => Iff.rfl)]
-      refine Finset.prod_congr rfl ?_
-      rintro ⟨x, hx⟩ _
-      rw [hglue_in _ _ _ hx]
-    · rw [Finset.prod_subtype (s := Sᶜ) (p := fun x => x ∉ S)
-            (fun _ => by simp)]
-      refine Finset.prod_congr rfl ?_
-      rintro ⟨x, hx⟩ _
-      rw [hglue_out _ _ _ hx]
-  -- Per-variable column sum: `∑_b h x b = P.prob x + (1 - P.prob x) = 1`.
-  have hsumcol : ∀ x, (∑ b : Bool, h x b) = 1 := by
-    intro x
-    show (∑ b : Bool, if b then P.prob x else 1 - P.prob x) = 1
-    have hu : (Finset.univ : Finset Bool) = {false, true} := by decide
-    rw [hu, Finset.sum_insert (by decide : (false : Bool) ∉ ({true} : Finset Bool)),
-        Finset.sum_singleton]
-    simp
-  -- Marginal sums on each half.
-  have sum_pS_eq_one : (∑ vS : {x // x ∈ S} → Bool, pS vS) = 1 := by
-    show (∑ vS : {x // x ∈ S} → Bool, ∏ x : {x // x ∈ S}, h ↑x (vS x)) = 1
-    rw [← Fintype.prod_sum (fun (x : {x // x ∈ S}) (b : Bool) => h ↑x b)]
-    exact Finset.prod_eq_one (fun x _ => hsumcol ↑x)
-  have sum_pR_eq_one : (∑ vR : {x // x ∉ S} → Bool, pR vR) = 1 := by
-    show (∑ vR : {x // x ∉ S} → Bool, ∏ x : {x // x ∉ S}, h ↑x (vR x)) = 1
-    rw [← Fintype.prod_sum (fun (x : {x // x ∉ S}) (b : Bool) => h ↑x b)]
-    exact Finset.prod_eq_one (fun x _ => hsumcol ↑x)
-  -- Sum-of-valuations rewriting along the split.
-  have hsum_iterated : ∀ F : (X → Bool) → ℚ,
-      (∑ v : X → Bool, F v)
-        = ∑ vS : {x // x ∈ S} → Bool, ∑ vR : {x // x ∉ S} → Bool, F (glue vS vR) := by
-    intro F
-    have h1 : (∑ v : X → Bool, F v)
-        = ∑ p : ({x // x ∈ S} → Bool) × ({x // x ∉ S} → Bool), F (e.symm p) :=
-      (Equiv.sum_comp e.symm F).symm
-    rw [h1]
-    exact Fintype.sum_prod_type' (fun vS vR => F (glue vS vR))
-  -- Pr(f) = ∑_vS (if fS vS then pS vS else 0).
-  have hPr_f : P.funcProb f = ∑ vS : {x // x ∈ S} → Bool,
-                                (if fS vS then pS vS else 0) := by
-    show (∑ v : X → Bool, if f v then P.valProb v else 0)
-        = ∑ vS : {x // x ∈ S} → Bool, (if fS vS then pS vS else 0)
-    rw [hsum_iterated (fun v => if f v then P.valProb v else 0)]
-    refine Finset.sum_congr rfl ?_
-    intro vS _
-    simp_rw [hfeq vS, hval_split vS]
-    by_cases hfs : fS vS
-    · simp_rw [if_pos hfs]
-      rw [← Finset.mul_sum, sum_pR_eq_one, mul_one]
-    · simp_rw [if_neg hfs]; simp
-  -- Pr(g) = ∑_vR (if gR vR then pR vR else 0).
-  have hPr_g : P.funcProb g = ∑ vR : {x // x ∉ S} → Bool,
-                                (if gR vR then pR vR else 0) := by
-    show (∑ v : X → Bool, if g v then P.valProb v else 0)
-        = ∑ vR : {x // x ∉ S} → Bool, (if gR vR then pR vR else 0)
-    rw [hsum_iterated (fun v => if g v then P.valProb v else 0)]
-    rw [Finset.sum_comm]
-    refine Finset.sum_congr rfl ?_
-    intro vR _
-    simp_rw [hgeq _ vR, hval_split _ vR]
-    by_cases hgs : gR vR
-    · simp_rw [if_pos hgs]
-      rw [← Finset.sum_mul, sum_pS_eq_one, one_mul]
-    · simp_rw [if_neg hgs]; simp
-  -- Pr(f * g) factors via Fintype.sum_mul_sum.
-  show (∑ v : X → Bool, if ((f * g) v : Bool) then P.valProb v else 0)
-      = P.funcProb f * P.funcProb g
-  rw [hsum_iterated (fun v => if ((f * g) v : Bool) then P.valProb v else 0)]
-  rw [hPr_f, hPr_g, Fintype.sum_mul_sum]
-  refine Finset.sum_congr rfl ?_
-  intro vS _
-  refine Finset.sum_congr rfl ?_
-  intro vR _
-  have hcomb : ((f * g) (glue vS vR) : Bool) = (fS vS && gR vR) := by
-    show (f (glue vS vR) && g (glue vS vR)) = (fS vS && gR vR)
-    rw [hfeq, hgeq]
-  rw [hcomb, hval_split]
-  cases hf' : fS vS <;> cases hg' : gR vR <;> simp
+Random-world projection commutes with annotated query evaluation: for any
+non-aggregation query `q`, taking the random world `v` of the annotated
+result is the same as evaluating `q` on the random-world database. The proof
+is a structural induction on `q`, covering all non-aggregation constructors
+(including `Prod`, `Dedup`, and `Diff`).
 
-/-- `Pr(f + g) = Pr(f) + Pr(g) - Pr(f * g)`: the universal inclusion-exclusion
-identity for the BoolFunc disjunction (`+`) and conjunction (`*`). No
-disjointness hypothesis is needed; the formula holds pointwise on each summand
-via the Bool identity `(b₁ || b₂).toℚ = b₁.toℚ + b₂.toℚ - (b₁ && b₂).toℚ`. -/
-theorem funcProb_add_eq (f g : BoolFunc X) :
-    P.funcProb (f + g) = P.funcProb f + P.funcProb g - P.funcProb (f * g) := by
-  unfold funcProb
-  -- The Bool identity, lifted to the ℚ-weighted sum.
-  have hpoint : ∀ v : X → Bool,
-      (if ((f + g : BoolFunc X) v : Bool) then P.valProb v else 0)
-      = (if (f v : Bool) then P.valProb v else 0)
-        + (if (g v : Bool) then P.valProb v else 0)
-        - (if ((f * g : BoolFunc X) v : Bool) then P.valProb v else 0) := by
-    intro v
-    show (if (f v || g v : Bool) then P.valProb v else 0)
-        = (if (f v : Bool) then P.valProb v else 0)
-          + (if (g v : Bool) then P.valProb v else 0)
-          - (if ((f v && g v : Bool)) then P.valProb v else 0)
-    cases hfv : f v <;> cases hgv : g v <;> simp
-  rw [show (∑ v : X → Bool, if ((f + g : BoolFunc X) v : Bool) then P.valProb v else 0)
-        = ∑ v : X → Bool,
-            ((if (f v : Bool) then P.valProb v else 0)
-            + (if (g v : Bool) then P.valProb v else 0)
-            - (if ((f * g : BoolFunc X) v : Bool) then P.valProb v else 0)) from
-    Finset.sum_congr rfl (fun v _ => hpoint v)]
-  rw [Finset.sum_sub_distrib, ← Finset.sum_add_distrib]
+This is the adequacy theorem for the non-monotone fragment: a bag-level
+equality between the annotated semantics (specialized to a possible world)
+and the plain semantics, valid in the presence of difference and duplicate
+elimination. It is the `𝔹`-valuation counterpart of the `ℕ`-adequacy theorem
+of [Benzaken, Cohen-Boulakia, Contejean, Keller & Zucchini, *A Coq
+Formalization of Data Provenance*][benzaken2021coq], which is restricted to
+the positive fragment – necessarily so, since `ℕ`-adequacy fails as soon as
+monus-based difference interacts with duplicate elimination (see
+`Nat.counterexample_diff_adequacy` in `Provenance.QueryAdequacy`). -/
+
+variable {K : Type} [SemiringWithMonus K] [DecidableEq K]
+
+omit [Fintype X] [DecidableEq X] in
+theorem randomWorld_evaluateAnnotated :
+    ∀ {n} (q : Query T n) (hq : q.source)
+      (Î : AnnotatedDatabase T (BoolFunc X)) (v : X → Bool),
+    randomWorld v (q.evaluateAnnotated hq Î) = q.evaluate (Î.randomWorld v) := by
+  intro n q
+  induction q with
+  | Rel n s =>
+    intro hq Î v
+    simp only [Query.evaluateAnnotated, Query.evaluate]
+    rw [AnnotatedDatabase.find_randomWorld]
+    cases hf : Î.find n s
+    · rfl
+    · simp
+  | Proj ts q' ih =>
+    intro hq Î v
+    simp only [Query.evaluateAnnotated, Query.evaluate]
+    rw [← randomWorld_map_data v (fun u : Tuple T _ => fun k => (ts k).eval u),
+        ih (Query.sourceProj hq rfl) Î v]
+  | Sel φ q' ih =>
+    intro hq Î v
+    simp only [Query.evaluateAnnotated, Query.evaluate]
+    rw [← ih (Query.sourceSel hq rfl) Î v]
+    generalize q'.evaluateAnnotated (Query.sourceSel hq rfl) Î = r
+    -- Goal: `randomWorld v (filter_Lex r) = filter φ.eval (randomWorld v r)`.
+    -- `randomWorld_filter_data` gives the same equation with a different
+    -- `DecidablePred` instance on the inner filter; bridge via
+    -- `Subsingleton.elim` (`Decidable` is subsingleton-extensional).
+    have h := (randomWorld_filter_data v φ.eval r).symm
+    have hinst : (fun a : AnnotatedTuple T (BoolFunc X) _ => φ.evalDecidable a.fst)
+                  = φ.evalDecidableAnnotated := Subsingleton.elim _ _
+    rw [hinst] at h
+    exact h
+  | Sum q₁ q₂ ih₁ ih₂ =>
+    intro hq Î v
+    simp only [Query.evaluateAnnotated, Query.evaluate]
+    rw [randomWorld_add, ih₁ (Query.sourceSum hq rfl).left Î v,
+        ih₂ (Query.sourceSum hq rfl).right Î v]
+  | @Prod n₁ n₂ n hn q₁ q₂ ih₁ ih₂ =>
+    intro hq Î v
+    simp only [Query.evaluateAnnotated, Query.evaluate]
+    rw [← ih₁ (Query.sourceProd hq rfl).left Î v,
+        ← ih₂ (Query.sourceProd hq rfl).right Î v]
+    set r₁ := q₁.evaluateAnnotated (Query.sourceProd hq rfl).left Î with hr₁
+    set r₂ := q₂.evaluateAnnotated (Query.sourceProd hq rfl).right Î with hr₂
+    -- After `subst hn`, the `Eq.mp` cast inside the LHS map and the
+    -- `Relation.cast` on the RHS both reduce to identity.
+    subst hn
+    -- Local helper: `randomWorld v (a ::ₘ t)` is an `if` on `a.snd v`. Stated
+    -- in the bare-Multiset (unfolded `randomWorld`) form so all filters are
+    -- Prod-typed and the Lex/Prod typeclass mismatch never arises.
+    have hrw_cons : ∀ {k : ℕ} (a : Tuple T k × BoolFunc X)
+        (t : Multiset (Tuple T k × BoolFunc X)),
+        Multiset.map Prod.fst
+            (Multiset.filter (fun p : Tuple T k × BoolFunc X => p.snd v = true) (a ::ₘ t))
+          = if a.snd v = true then
+              a.fst ::ₘ Multiset.map Prod.fst
+                  (Multiset.filter (fun p : Tuple T k × BoolFunc X => p.snd v = true) t)
+            else Multiset.map Prod.fst
+                  (Multiset.filter (fun p : Tuple T k × BoolFunc X => p.snd v = true) t) := by
+      intro k a t
+      by_cases ha : a.snd v = true
+      · rw [Multiset.filter_cons_of_pos
+              (p := fun p : Tuple T k × BoolFunc X => p.snd v = true) _ ha,
+            Multiset.map_cons]
+        simp [ha]
+      · rw [Multiset.filter_cons_of_neg
+              (p := fun p : Tuple T k × BoolFunc X => p.snd v = true) _ ha]
+        simp [ha]
+    -- Helper for the cons-head: fixing the left annotated tuple `p`, the
+    -- random world of the product slice `Multiset.product {p} r₂'` matches
+    -- `Multiset.product {p.fst} (randomWorld v r₂')` (when `p.snd v = true`)
+    -- or vanishes (when `p.snd v = false`). Stated in fully unfolded form on
+    -- both sides so all filters are Prod-typed.
+    have h_head : ∀ (p : Tuple T n₁ × BoolFunc X)
+        (r₂' : Multiset (Tuple T n₂ × BoolFunc X)),
+        Multiset.map Prod.fst
+            (Multiset.filter (fun q : Tuple T (n₁ + n₂) × BoolFunc X => q.snd v = true)
+              (Multiset.map (fun pq : (Tuple T n₁ × BoolFunc X) × (Tuple T n₂ × BoolFunc X) =>
+                  ((Fin.append pq.fst.fst pq.snd.fst : Tuple T (n₁ + n₂)),
+                    pq.fst.snd * pq.snd.snd))
+                (Multiset.map (Prod.mk p) r₂')))
+          = if p.snd v = true then
+              Multiset.map (fun pq : Tuple T n₁ × Tuple T n₂ => Fin.append pq.fst pq.snd)
+                (Multiset.map (Prod.mk p.fst)
+                  (Multiset.map Prod.fst
+                    (Multiset.filter (fun q : Tuple T n₂ × BoolFunc X => q.snd v = true) r₂')))
+            else 0 := by
+      intro p r₂'
+      induction r₂' using Multiset.induction_on with
+      | empty =>
+        by_cases hp : p.snd v = true
+        · rw [if_pos hp]; rfl
+        · rw [if_neg hp]; rfl
+      | cons q t ih_q =>
+        rw [Multiset.map_cons, Multiset.map_cons]
+        by_cases hpv : p.snd v = true
+        · by_cases hqv : q.snd v = true
+          · -- both annotations hold at v: head term survives both filters
+            have h_combined : (p.snd * q.snd) v = true := by
+              show (p.snd v && q.snd v) = true
+              rw [hpv, hqv]; rfl
+            rw [Multiset.filter_cons_of_pos
+                  (p := fun q : Tuple T (n₁ + n₂) × BoolFunc X => q.snd v = true)
+                  _ h_combined,
+                Multiset.map_cons]
+            rw [if_pos hpv] at ih_q
+            rw [ih_q, if_pos hpv]
+            rw [Multiset.filter_cons_of_pos
+                  (p := fun q : Tuple T n₂ × BoolFunc X => q.snd v = true) _ hqv,
+                Multiset.map_cons, Multiset.map_cons, Multiset.map_cons]
+          · -- p annotation true, q annotation false: head filtered out both sides
+            have h_combined : ¬ (p.snd * q.snd) v = true := by
+              show ¬ (p.snd v && q.snd v) = true
+              rw [hpv]; simp [hqv]
+            rw [Multiset.filter_cons_of_neg
+                  (p := fun q : Tuple T (n₁ + n₂) × BoolFunc X => q.snd v = true)
+                  _ h_combined]
+            rw [if_pos hpv] at ih_q
+            rw [ih_q, if_pos hpv]
+            rw [Multiset.filter_cons_of_neg
+                  (p := fun q : Tuple T n₂ × BoolFunc X => q.snd v = true) _ hqv]
+        · -- p annotation false: every combined annotation is false, total is 0
+          have hpv_false : p.snd v = false := by
+            cases h : p.snd v
+            · rfl
+            · exact absurd h hpv
+          have h_combined : ¬ (p.snd * q.snd) v = true := by
+            show ¬ (p.snd v && q.snd v) = true
+            rw [hpv_false]; simp
+          rw [Multiset.filter_cons_of_neg
+                (p := fun q : Tuple T (n₁ + n₂) × BoolFunc X => q.snd v = true)
+                _ h_combined]
+          rw [if_neg hpv] at ih_q
+          rw [ih_q, if_neg hpv]
+    -- Now induct on r₁ at the bare-Multiset carrier; also expose `r₂` so its
+    -- type matches the helper signatures and the `Multiset.product` arguments.
+    let r₁' : Multiset (Tuple T n₁ × BoolFunc X) := r₁
+    let r₂' : Multiset (Tuple T n₂ × BoolFunc X) := r₂
+    show Multiset.map Prod.fst
+          (Multiset.filter (fun p : Tuple T (n₁ + n₂) × BoolFunc X => p.snd v = true)
+            (Multiset.map (fun p : (Tuple T n₁ × BoolFunc X) × (Tuple T n₂ × BoolFunc X) =>
+                ((Fin.append p.fst.fst p.snd.fst : Tuple T (n₁ + n₂)), p.fst.snd * p.snd.snd))
+              (Multiset.product r₁' r₂'))) =
+        Multiset.map (fun p : Tuple T n₁ × Tuple T n₂ => Fin.append p.fst p.snd)
+          (Multiset.product
+            (Multiset.map Prod.fst
+              (Multiset.filter (fun p : Tuple T n₁ × BoolFunc X => p.snd v = true) r₁'))
+            (Multiset.map Prod.fst
+              (Multiset.filter (fun p : Tuple T n₂ × BoolFunc X => p.snd v = true) r₂')))
+    induction r₁' using Multiset.induction_on with
+    | empty => rfl
+    | cons p s ih =>
+      -- `Multiset.cons_product` from Mathlib is stated with `×ˢ` notation; the
+      -- goal uses `.product` (the underlying `def`). They are definitionally
+      -- equal, so unfold `Multiset.product` to `bind` and use `cons_bind`.
+      have hcp_left : Multiset.product (p ::ₘ s) r₂'
+          = Multiset.map (Prod.mk p) r₂' + Multiset.product s r₂' := by
+        unfold Multiset.product
+        rw [Multiset.cons_bind]
+      -- LHS: distribute product/map/filter over the cons of `r₁`.
+      rw [hcp_left, Multiset.map_add, Multiset.filter_add, Multiset.map_add]
+      -- RHS: factor `randomWorld v (p ::ₘ s)` via `hrw_cons` and apply `h_head`.
+      rw [hrw_cons p s, h_head p r₂']
+      by_cases hpv : p.snd v = true
+      · -- Same form for the RHS product after `if_pos hpv` exposes a cons.
+        have hcp_rhs : Multiset.product (p.fst ::ₘ Multiset.map Prod.fst
+              (Multiset.filter (fun p : Tuple T n₁ × BoolFunc X => p.snd v = true) s))
+            (Multiset.map Prod.fst
+              (Multiset.filter (fun p : Tuple T n₂ × BoolFunc X => p.snd v = true) r₂'))
+          = Multiset.map (Prod.mk p.fst) (Multiset.map Prod.fst
+              (Multiset.filter (fun p : Tuple T n₂ × BoolFunc X => p.snd v = true) r₂'))
+            + Multiset.product (Multiset.map Prod.fst
+                (Multiset.filter (fun p : Tuple T n₁ × BoolFunc X => p.snd v = true) s))
+              (Multiset.map Prod.fst
+                (Multiset.filter (fun p : Tuple T n₂ × BoolFunc X => p.snd v = true) r₂')) := by
+          unfold Multiset.product
+          rw [Multiset.cons_bind]
+        rw [if_pos hpv, if_pos hpv, hcp_rhs, Multiset.map_add, ih]
+      · rw [if_neg hpv, if_neg hpv]
+        rw [ih]
+        exact (Multiset.zero_add _)
+  | Dedup q' ih =>
+    intro hq Î v
+    simp only [Query.evaluateAnnotated, Query.evaluate]
+    rw [← ih (Query.sourceDedup hq rfl) Î v]
+    set r := q'.evaluateAnnotated (Query.sourceDedup hq rfl) Î with hr
+    -- Both sides are `Nodup` multisets of `Tuple T n`. We show element
+    -- equivalence: t ∈ LHS ↔ ∃ (t', α') ∈ r with t' = t and α' v = true ↔ t ∈ RHS.
+    have hgbk_nodup : (Multiset.ofList (groupByKey r).val :
+        Multiset (Tuple T _ × BoolFunc X)).Nodup := by
+      rw [Multiset.coe_nodup]
+      exact KeyValueList.nodup _ (groupByKey r).property
+    have hLNodup : (randomWorld v (Multiset.ofList (groupByKey r).val)).Nodup := by
+      show (Multiset.map Prod.fst _).Nodup
+      apply Multiset.Nodup.map_on
+      · -- Local injectivity: same-key entries of `groupByKey` agree.
+        intro p hp q hq hpq
+        rw [Multiset.mem_filter] at hp hq
+        have hp_list : p ∈ (groupByKey r).val := Multiset.mem_coe.mp hp.1
+        have hq_list : q ∈ (groupByKey r).val := Multiset.mem_coe.mp hq.1
+        have hsnd := KeyValueList.functional _ (groupByKey r).property
+          p hp_list q hq_list hpq
+        exact Prod.ext hpq hsnd
+      · exact Multiset.Nodup.filter _ hgbk_nodup
+    have hRNodup : (Multiset.dedup (randomWorld v r)).Nodup := Multiset.nodup_dedup _
+    rw [Multiset.Nodup.ext hLNodup hRNodup]
+    intro t
+    -- The membership condition on both sides reduces to:
+    -- `∃ (t', α') ∈ r with t' = t and α' v = true`.
+    constructor
+    · rintro ht
+      show t ∈ Multiset.dedup (randomWorld v r)
+      rw [Multiset.mem_dedup]
+      -- ht : t ∈ randomWorld v (ofList (groupByKey r).val)
+      show t ∈ randomWorld v r
+      unfold randomWorld at ht ⊢
+      rw [Multiset.mem_map] at ht
+      obtain ⟨p, hp, hpfst⟩ := ht
+      rw [Multiset.mem_filter] at hp
+      obtain ⟨hp_in, hp_snd⟩ := hp
+      have hp_list : p ∈ (groupByKey r).val := Multiset.mem_coe.mp hp_in
+      -- (p.fst, p.snd) ∈ (groupByKey r).val so groupByKey_value applies.
+      have hp_val : p.snd = (Multiset.map Prod.snd
+            (Multiset.filter (fun q : AnnotatedTuple T (BoolFunc X) _ ↦ q.fst = p.fst) r)).sum :=
+        groupByKey_value r p.fst p.snd hp_list
+      rw [hp_val, boolFunc_multiset_sum_apply, bool_multiset_sum_eq_true] at hp_snd
+      obtain ⟨b, hb_in, hb_true⟩ := hp_snd
+      rw [Multiset.mem_map] at hb_in
+      obtain ⟨α, hα_in, hα_eq⟩ := hb_in
+      rw [Multiset.mem_map] at hα_in
+      obtain ⟨α_pair, hα_pair_in, hα_pair_snd⟩ := hα_in
+      rw [Multiset.mem_filter] at hα_pair_in
+      obtain ⟨hα_r, hα_fst⟩ := hα_pair_in
+      -- α_pair ∈ r with α_pair.fst = p.fst and α_pair.snd v = true
+      rw [Multiset.mem_map]
+      refine ⟨α_pair, ?_, ?_⟩
+      · rw [Multiset.mem_filter]
+        refine ⟨hα_r, ?_⟩
+        rw [hα_pair_snd, hα_eq, hb_true]
+      · rw [hα_fst, hpfst]
+    · rintro ht
+      rw [Multiset.mem_dedup] at ht
+      show t ∈ randomWorld v (Multiset.ofList (groupByKey r).val)
+      unfold randomWorld at ht ⊢
+      rw [Multiset.mem_map] at ht
+      obtain ⟨α_pair, hα_in, hα_fst⟩ := ht
+      rw [Multiset.mem_filter] at hα_in
+      obtain ⟨hα_r, hα_v⟩ := hα_in
+      -- α_pair ∈ r with α_pair.fst = t and α_pair.snd v = true
+      have hmem_map : t ∈ Multiset.map Prod.fst r := by
+        rw [Multiset.mem_map]; exact ⟨α_pair, hα_r, hα_fst⟩
+      obtain ⟨w, hw_in⟩ := (groupByKey_key_iff r t).mpr hmem_map
+      have hw_val : w = (Multiset.map Prod.snd
+            (Multiset.filter (fun q : AnnotatedTuple T (BoolFunc X) _ ↦ q.fst = t) r)).sum :=
+        groupByKey_value r t w hw_in
+      have hw_v_true : w v = true := by
+        rw [hw_val, boolFunc_multiset_sum_apply, bool_multiset_sum_eq_true]
+        refine ⟨α_pair.snd v, ?_, hα_v⟩
+        rw [Multiset.mem_map]
+        refine ⟨α_pair.snd, ?_, rfl⟩
+        rw [Multiset.mem_map]
+        refine ⟨α_pair, ?_, rfl⟩
+        rw [Multiset.mem_filter]
+        exact ⟨hα_r, hα_fst⟩
+      rw [Multiset.mem_map]
+      refine ⟨(t, w), ?_, rfl⟩
+      rw [Multiset.mem_filter]
+      exact ⟨Multiset.mem_coe.mpr hw_in, hw_v_true⟩
+  | Diff q₁ q₂ ih₁ ih₂ =>
+    intro hq Î v
+    simp only [Query.evaluateAnnotated, Query.evaluate]
+    rw [← ih₁ (Query.sourceDiff hq rfl).left Î v,
+        ← ih₂ (Query.sourceDiff hq rfl).right Î v]
+    set r₁ := q₁.evaluateAnnotated (Query.sourceDiff hq rfl).left Î with hr₁
+    set r₂ := q₂.evaluateAnnotated (Query.sourceDiff hq rfl).right Î with hr₂
+    -- Local helper: random-world of a cons splits via if-then-else.
+    -- Stated in the bare-Multiset form (the unfolded `randomWorld`) so the
+    -- pattern matches the goal's Lex-coerced filter+map term.
+    have hrw_cons : ∀ {k : ℕ} (a : Tuple T k × BoolFunc X)
+        (t : Multiset (Tuple T k × BoolFunc X)),
+        Multiset.map Prod.fst
+            (Multiset.filter (fun p : Tuple T k × BoolFunc X => p.snd v = true) (a ::ₘ t))
+          = if a.snd v = true then
+              a.fst ::ₘ Multiset.map Prod.fst
+                  (Multiset.filter (fun p : Tuple T k × BoolFunc X => p.snd v = true) t)
+            else Multiset.map Prod.fst
+                  (Multiset.filter (fun p : Tuple T k × BoolFunc X => p.snd v = true) t) := by
+      intro k a t
+      by_cases ha : a.snd v = true
+      · rw [Multiset.filter_cons_of_pos
+              (p := fun p : Tuple T k × BoolFunc X => p.snd v = true) _ ha,
+            Multiset.map_cons]
+        simp [ha]
+      · rw [Multiset.filter_cons_of_neg
+              (p := fun p : Tuple T k × BoolFunc X => p.snd v = true) _ ha]
+        simp [ha]
+    -- Induct on r₁ at the Prod-type carrier. We must override `randomWorld`
+    -- to accept `Multiset (Tuple T _ × BoolFunc X)` directly so the pattern
+    -- in the recursive `hrw_cons` call matches the goal's coerced form.
+    let r₁' : Multiset (Tuple T _ × BoolFunc X) := r₁
+    show Multiset.map Prod.fst
+          (Multiset.filter (fun p : Tuple T _ × BoolFunc X => p.snd v = true)
+            (r₁'.map (fun p : Tuple T _ × BoolFunc X =>
+              (p.fst, p.snd -
+                (((groupByKey r₂).val.find? (fun q => q.1 = p.fst)).map Prod.snd).getD 0))))
+        = Multiset.filter (fun t => t ∉ randomWorld v r₂)
+            (Multiset.map Prod.fst
+              (Multiset.filter (fun p : Tuple T _ × BoolFunc X => p.snd v = true) r₁'))
+    induction r₁' using Multiset.induction_on with
+    | empty => rfl
+    | cons p s ih =>
+      -- Set β to the diff annotation for `p.fst`. We define β AFTER
+      -- `Multiset.map_cons` fires so the goal's term contains β by construction.
+      rw [Multiset.map_cons]
+      set β : BoolFunc X :=
+          ((List.find? (fun q : Tuple T _ × BoolFunc X => decide (q.1 = p.fst))
+            (groupByKey r₂).val).map Prod.snd).getD 0 with hβ_def
+      have hβ_iff : β v = false ↔ p.fst ∉ randomWorld v r₂ :=
+        diff_annotation_eq_false_iff v r₂ p.fst
+      -- Pull cons through randomWorld on both LHS and RHS.
+      rw [hrw_cons (a := (p.fst, p.snd - β))]
+      conv_rhs => rw [hrw_cons (a := p) (t := s)]
+      -- The cons-head's snd-at-v on the LHS reduces to `p.snd v && !(β v)`.
+      have hlhs_eq : (p.fst, p.snd - β).snd v = (p.snd v && !(β v)) := rfl
+      by_cases hpv : p.snd v = true
+      · -- p.snd v = true. Case on β v.
+        by_cases hbv : β v = false
+        · -- β v = false ⇒ p.fst ∉ rw v r₂.
+          have hp_notin : p.fst ∉ randomWorld v r₂ := hβ_iff.mp hbv
+          have hcond_lhs : (p.snd - β) v = true := by
+            rw [show (p.snd - β) v = (p.snd v && !(β v)) from rfl, hpv, hbv]; rfl
+          rw [if_pos hcond_lhs, if_pos hpv, ih]
+          rw [Multiset.filter_cons_of_pos
+                (p := fun t : Tuple T _ => t ∉ randomWorld v r₂) _ hp_notin]
+        · -- β v ≠ false, so β v = true; p.fst ∈ rw v r₂.
+          have hbv_true : β v = true := by
+            cases h : β v
+            · exact absurd h hbv
+            · rfl
+          have hp_in : ¬ p.fst ∉ randomWorld v r₂ := by
+            intro h; exact absurd (hβ_iff.mpr h) hbv
+          have hcond_lhs : ¬ (p.snd - β) v = true := by
+            rw [show (p.snd - β) v = (p.snd v && !(β v)) from rfl, hpv, hbv_true]
+            simp
+          rw [if_neg hcond_lhs, if_pos hpv, ih]
+          rw [Multiset.filter_cons_of_neg
+                (p := fun t : Tuple T _ => t ∉ randomWorld v r₂) _ hp_in]
+      · -- p.snd v = false: cond on LHS reduces to `false`.
+        have hpv_false : p.snd v = false := by
+          cases h : p.snd v
+          · rfl
+          · exact absurd h hpv
+        have hcond_lhs : ¬ (p.snd - β) v = true := by
+          rw [show (p.snd - β) v = (p.snd v && !(β v)) from rfl, hpv_false]; simp
+        rw [if_neg hcond_lhs, if_neg hpv]
+        exact ih
+  | ProvSum _ _ _ =>
+    intro hq _ _
+    exact False.elim (by simp [Query.source] at hq)
+  | Having _ _ _ _ _ _ _ =>
+    intro hq _ _
+    exact False.elim (by simp [Query.source] at hq)
+
+namespace ProbAssignment
+
+variable (P : ProbAssignment X)
+
+/-- **Theorem 12** ([Sen et al.][sen2026provsql], Section IV-D).
+For any non-aggregation query `q`, any `BoolFunc X`-annotated database `Î`
+and any tuple `t`, the marginal probability that `t` appears in the random
+output of `q` equals the probability of the disjunctive tuple annotation
+of `t` in the annotated query result `⟪q⟫^Î`.
+
+This is the formal justification for the intensional approach to
+probabilistic query evaluation: instead of enumerating exponentially-many
+possible worlds, evaluate the query once over `BoolFunc X`-annotations and
+take the probability of the resulting Boolean function.
+
+The proof reduces to (a) `tupleAnnotation_apply_eq_true_iff`, the pointwise
+reading of the disjunctive annotation, and (b) `randomWorld_evaluateAnnotated`,
+the commutation of plain query evaluation with random-world projection. -/
+theorem theorem_12
+    (q : Query T n) (hq : q.source)
+    (Î : AnnotatedDatabase T (BoolFunc X)) (t : Tuple T n) :
+    P.marginalProb q Î t
+      = P.funcProb (tupleAnnotation (q.evaluateAnnotated hq Î) t) := by
+  unfold marginalProb funcProb
+  apply Finset.sum_congr rfl
+  intro v _
+  -- Both indicators are the same: t ∈ randomWorld v (⟪q⟫_Î) ↔ tupleAnnotation _ _ v
+  have hcond :
+      t ∈ q.evaluate (Î.randomWorld v)
+        ↔ (tupleAnnotation (q.evaluateAnnotated hq Î) t) v = true := by
+    rw [← randomWorld_evaluateAnnotated q hq Î v]
+    exact (tupleAnnotation_apply_eq_true_iff _ _ _).symm
+  by_cases h : (tupleAnnotation (q.evaluateAnnotated hq Î) t) v = true
+  · simp [h, hcond.mpr h]
+  · have hmem : ¬ t ∈ q.evaluate (Î.randomWorld v) :=
+      fun hm => h (hcond.mp hm)
+    have hf : (tupleAnnotation (q.evaluateAnnotated hq Î) t) v = false := by
+      cases h' : (tupleAnnotation (q.evaluateAnnotated hq Î) t) v
+      · rfl
+      · exact absurd h' h
+    simp [hmem, hf]
+
+end ProbAssignment
+
+/-! ## Corollary 13: probability via the plain rewritten query
+
+Theorem 12 expresses the marginal probability `Pr(t ∈ q(Î))` as the
+probability of the disjunctive tuple annotation of `t` in the annotated query
+result `⟪q⟫^Î`. Combining it with the rewriting-correctness theorem
+`Query.rewriting_valid` (Theorem 10 of [Sen et al.][sen2026provsql],
+rules R1–R5) gives the same identity using the **plain** rewritten query
+`q̂ = q.rewriting hq` evaluated on the composite-encoded database
+`Î.toComposite`. This is the form a rewriting-based system runs against the
+underlying database engine.
+
+The corollary statement requires `[HasAltLinearOrder (BoolFunc X)]` purely so
+that `Î.toComposite : Database (T ⊕ BoolFunc X)` typechecks (via the
+`ValueType (T ⊕ K)` instance in `Provenance.Util.ValueType`); any
+noncomputable linear order on `BoolFunc X` will do. -/
+
+namespace ProbAssignment
+
+variable (P : ProbAssignment X)
+
+/-- **Corollary 13** ([Sen et al.][sen2026provsql], Section IV-D).
+For any non-aggregation query `q`, any `BoolFunc X`-annotated database `Î`
+and any tuple `t`, the marginal probability that `t` appears in the random
+output of `q` equals the probability of the disjunctive annotation of `t`
+in the result of evaluating the **plain rewritten query** `q̂` on the
+composite-encoded database.
+
+Combines `theorem_12` and `Query.rewriting_valid`. -/
+theorem corollary_13 [HasAltLinearOrder (BoolFunc X)]
+    (q : Query T n) (hq : q.source)
+    (Î : AnnotatedDatabase T (BoolFunc X)) (t : Tuple T n) :
+    P.marginalProb q Î t
+      = P.funcProb (tupleAnnotation
+          (Multiset.map Tuple.fromComposite
+            ((q.rewriting hq).evaluate Î.toComposite)) t) := by
+  rw [P.theorem_12 q hq Î t,
+      ← Query.rewriting_valid q hq Î,
+      AnnotatedRelation.map_fromComposite_toComposite]
 
 end ProbAssignment

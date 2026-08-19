@@ -1,0 +1,533 @@
+import Mathlib.Data.Finsupp.Defs
+import Mathlib.Data.Fin.VecNotation
+import Mathlib.Data.FunLike.Basic
+import Mathlib.Data.Vector.Basic
+import Mathlib.Data.Multiset.Dedup
+import Mathlib.Data.Multiset.Filter
+import Mathlib.Data.Multiset.Sort
+import Mathlib.Data.Prod.Lex
+
+import Provenance.Algorithms.CompOp
+import Provenance.Database
+
+/-!
+# Relational algebra
+
+This file defines the abstract syntax and semantics of relational algebra queries over
+plain (unannotated) databases. The language is the *extended relational algebra*
+described in Section III of
+[Sen et al., *ProvSQL: A General System for Keeping Track of the
+Provenance and Probability of Data*][sen2026provsql], with multiset semantics,
+explicit duplicate elimination, multiset difference, and aggregation.
+
+## Main definitions
+
+* `Term T n` – an expression that evaluates to a value of type `T` in the context of
+  a tuple of arity `n` (constants, tuple projections, and arithmetic operations)
+* `Query T` – a relational algebra query: selection, projection, union, join,
+  difference, and renaming
+* `Query.evaluate` – the standard set semantics of queries over `Database T`
+
+## References
+
+* [Sen et al., *ProvSQL*][sen2026provsql] (Section III)
+-/
+
+variable {T: Type} [ValueType T]
+
+inductive Term T n where
+| const : T → Term T n
+| index : Fin n → Term T n
+| add : Term T n → Term T n → Term T n
+| sub : Term T n → Term T n → Term T n
+| mul : Term T n → Term T n → Term T n
+
+def Term.repr [Repr T] : Term T n → ℕ → Std.Format
+| const a, _ => reprArg a
+| index k, _ => "#" ++ (reprArg k)
+| add t₁ t₂, p => Repr.addAppParen (repr t₁ p ++ "+" ++ repr t₂ p) p
+| sub t₁ t₂, p => Repr.addAppParen (repr t₁ p ++ "-" ++ repr t₂ p) p
+| mul t₁ t₂, p => Repr.addAppParen (repr t₁ p ++ "*" ++ repr t₂ p) p
+
+instance [Repr α] : Repr (Term α n) := ⟨Term.repr⟩
+
+def Term.castToAnnotatedTuple (t: Term T n) : Term (T⊕K) (n+1) := match t with
+| const c => const (Sum.inl c)
+| index k => index (k.castLT (k.val_lt_of_le (Nat.le_add_right n 1)))
+| add t₁ t₂ => add t₁.castToAnnotatedTuple t₂.castToAnnotatedTuple
+| sub t₁ t₂ => sub t₁.castToAnnotatedTuple t₂.castToAnnotatedTuple
+| mul t₁ t₂ => mul t₁.castToAnnotatedTuple t₂.castToAnnotatedTuple
+
+
+def Term.eval (term: Term T n) (tuple: Tuple T n) := match term with
+  | const a => a
+  | index k => tuple k
+  | add t₁ t₂ => (t₁.eval tuple) + (t₂.eval tuple)
+  | sub t₁ t₂ => (t₁.eval tuple) - (t₂.eval tuple)
+  | mul t₁ t₂ => (t₁.eval tuple) * (t₂.eval tuple)
+
+theorem Term.castToAnnotatedTuple_eval [HasAltLinearOrder K] [SemiringWithMonus K] (t: Term T n) (tuple: Tuple T n) :
+∀ α: K,
+  t.castToAnnotatedTuple.eval (Fin.append (λ k ↦ Sum.inl (tuple k)) ![Sum.inr α]) = Sum.inl (t.eval tuple) := by
+  intro α
+  induction t with
+  | const c =>
+    unfold castToAnnotatedTuple eval
+    simp
+  | index k =>
+    unfold castToAnnotatedTuple eval
+    have hk : k.castLT (lt_trans k.isLt (lt_add_one n)) = Fin.castAdd 1 k := rfl
+    rw[hk]
+    rw[Fin.append_left]
+  | add t₁ t₂ ih₁ ih₂ =>
+    unfold castToAnnotatedTuple eval
+    rw[ih₁, ih₂]
+    simp[(·+·),Add.add]
+  | sub t₁ t₂ ih₁ ih₂ =>
+    unfold castToAnnotatedTuple eval
+    rw[ih₁, ih₂]
+    simp[(·-·),Sub.sub]
+  | mul t₁ t₂ ih₁ ih₂ =>
+    unfold castToAnnotatedTuple eval
+    rw[ih₁, ih₂]
+    simp[(·*·),Mul.mul]
+
+instance : Coe T (Term T n) where
+  coe a:= Term.const a
+
+instance : OfNat (Term ℕ n) (a: ℕ) where
+  ofNat := Term.const a
+
+prefix:max "#" => Term.index
+
+inductive BoolTerm (T) (n: ℕ) where
+| EQ : Term T n → Term T n → BoolTerm T n
+| NE : Term T n → Term T n → BoolTerm T n
+| LE : Term T n → Term T n → BoolTerm T n
+| LT : Term T n → Term T n → BoolTerm T n
+| GE : Term T n → Term T n → BoolTerm T n
+| GT : Term T n → Term T n → BoolTerm T n
+
+def BoolTerm.repr [Repr T] : BoolTerm T n → ℕ → Std.Format
+| EQ t₁ t₂, p => Repr.addAppParen (t₁.repr p ++ "==" ++ t₂.repr p) p
+| NE t₁ t₂, p => Repr.addAppParen (t₁.repr p ++ "!=" ++ t₂.repr p) p
+| LE t₁ t₂, p => Repr.addAppParen (t₁.repr p ++ "<=" ++ t₂.repr p) p
+| LT t₁ t₂, p => Repr.addAppParen (t₁.repr p ++ "<" ++ t₂.repr p) p
+| GE t₁ t₂, p => Repr.addAppParen (t₁.repr p ++ ">=" ++ t₂.repr p) p
+| GT t₁ t₂, p => Repr.addAppParen (t₁.repr p ++ ">" ++ t₂.repr p) p
+
+instance [Repr α] : Repr (BoolTerm α n) := ⟨BoolTerm.repr⟩
+
+def BoolTerm.castToAnnotatedTuple (bt: BoolTerm T n): BoolTerm (T⊕K) (n+1) :=
+  match bt with
+  | EQ a b => EQ a.castToAnnotatedTuple b.castToAnnotatedTuple
+  | NE a b => NE a.castToAnnotatedTuple b.castToAnnotatedTuple
+  | LE a b => LE a.castToAnnotatedTuple b.castToAnnotatedTuple
+  | LT a b => LT a.castToAnnotatedTuple b.castToAnnotatedTuple
+  | GE a b => GE a.castToAnnotatedTuple b.castToAnnotatedTuple
+  | GT a b => GT a.castToAnnotatedTuple b.castToAnnotatedTuple
+
+infix:20 " == " => λ x y ↦ BoolTerm.EQ x y
+infix:20 " != " => λ x y ↦ BoolTerm.NE x y
+infix:20 " <= " => λ x y ↦ BoolTerm.LE x y
+infix:20 " < " => λ x y ↦ BoolTerm.LT x y
+infix:20 " >= " => λ x y ↦ BoolTerm.GE x y
+infix:20 " > " => λ x y ↦ BoolTerm.GT x y
+
+def BoolTerm.eval (φ: BoolTerm T n) (tuple: Tuple T n) := match φ with
+| EQ t₁ t₂ => (t₁.eval tuple) = (t₂.eval tuple)
+| NE t₁ t₂ => (t₁.eval tuple) ≠ (t₂.eval tuple)
+| LE t₁ t₂ => (t₁.eval tuple) ≤ (t₂.eval tuple)
+| LT t₁ t₂ => (t₁.eval tuple) < (t₂.eval tuple)
+| GE t₁ t₂ => (t₁.eval tuple) ≥ (t₂.eval tuple)
+| GT t₁ t₂ => (t₁.eval tuple) > (t₂.eval tuple)
+
+theorem BoolTerm.castToAnnotatedTuple_eval [HasAltLinearOrder K] [SemiringWithMonus K] (t: BoolTerm T n) (tuple: Tuple T n) :
+  ∀ α: K, t.castToAnnotatedTuple.eval (Fin.append (λ k ↦ Sum.inl (tuple k)) ![Sum.inr α]) = t.eval tuple := by
+    intro α
+    induction t with
+    | EQ t₁ t₂ =>
+      unfold BoolTerm.eval BoolTerm.castToAnnotatedTuple
+      simp
+      repeat rw[Term.castToAnnotatedTuple_eval]
+      simp
+    | NE t₁ t₂ =>
+      unfold BoolTerm.eval BoolTerm.castToAnnotatedTuple
+      simp
+      repeat rw[Term.castToAnnotatedTuple_eval]
+      simp
+    | LE t₁ t₂ =>
+      unfold BoolTerm.eval BoolTerm.castToAnnotatedTuple
+      simp
+      repeat rw[Term.castToAnnotatedTuple_eval]
+      exact ge_iff_le
+    | LT t₁ t₂ =>
+      unfold BoolTerm.eval BoolTerm.castToAnnotatedTuple
+      simp
+      repeat rw[Term.castToAnnotatedTuple_eval]
+      simp[LT.lt]
+      exact le_of_lt
+    | GE t₁ t₂ =>
+      unfold BoolTerm.eval BoolTerm.castToAnnotatedTuple
+      simp
+      repeat rw[Term.castToAnnotatedTuple_eval]
+      exact ge_iff_le
+    | GT t₁ t₂ =>
+      unfold BoolTerm.eval BoolTerm.castToAnnotatedTuple
+      simp
+      repeat rw[Term.castToAnnotatedTuple_eval]
+      simp[LT.lt]
+      exact le_of_lt
+
+@[reducible] def BoolTerm.evalDecidable (φ: BoolTerm T n) : DecidablePred φ.eval :=
+  λ t => by
+    cases φ <;> rename_i x y <;> simp [BoolTerm.eval]
+    . exact inferInstanceAs (Decidable (x.eval t = y.eval t))
+    . exact inferInstanceAs (Decidable (x.eval t ≠ y.eval t))
+    . exact inferInstanceAs (Decidable (x.eval t ≤ y.eval t))
+    . exact inferInstanceAs (Decidable (x.eval t < y.eval t))
+    . exact inferInstanceAs (Decidable (y.eval t ≤ x.eval t))
+    . exact inferInstanceAs (Decidable (y.eval t < x.eval t))
+
+inductive Selection (T) (n: ℕ) where
+| BT   : BoolTerm T n   → Selection T n
+| Not  : Selection T n → Selection T n
+| And  : Selection T n → Selection T n → Selection T n
+| Or   : Selection T n → Selection T n → Selection T n
+| True : Selection T n
+
+def Selection.repr [Repr T] : Selection T n → ℕ → Std.Format
+| BT t, p => t.repr p
+| Not f, p => "¬" ++ (Repr.addAppParen (f.repr p) p)
+| And t₁ t₂, p => Repr.addAppParen (t₁.repr p ++ "∧" ++ t₂.repr p) p
+| Or t₁ t₂, p => Repr.addAppParen (t₁.repr p ++ "∨" ++ t₂.repr p) p
+| True, _ => "True"
+
+instance [Repr α] : Repr (Selection α n) := ⟨Selection.repr⟩
+
+def Selection.castToAnnotatedTuple (f: Selection T n): Selection (T⊕K) (n+1) := match f with
+| BT  t     => BT t.castToAnnotatedTuple
+| Not φ     => Not φ.castToAnnotatedTuple
+| And φ₁ φ₂ => And φ₁.castToAnnotatedTuple φ₂.castToAnnotatedTuple
+| Or  φ₁ φ₂ => Or φ₁.castToAnnotatedTuple φ₂.castToAnnotatedTuple
+| True      => True
+
+def Selection.eval (φ: Selection T n) (tuple: Tuple T n) := match φ with
+| BT  φ     => φ.eval tuple
+| Not φ     => ¬ (φ.eval tuple)
+| And φ₁ φ₂ => (φ₁.eval tuple) ∧ (φ₂.eval tuple)
+| Or  φ₁ φ₂ => (φ₁.eval tuple) ∨ (φ₂.eval tuple)
+| True      => true
+
+theorem Selection.castToAnnotatedTuple_eval [HasAltLinearOrder K] [SemiringWithMonus K] (φ: Selection T n) (tuple: Tuple T n) :
+∀ α: K,
+  φ.castToAnnotatedTuple.eval (Fin.append (λ k ↦ Sum.inl (tuple k)) ![Sum.inr α]) = φ.eval tuple := by
+    intro α
+    induction φ with
+    | BT t =>
+      simp[Selection.eval,Selection.castToAnnotatedTuple]
+      rw[BoolTerm.castToAnnotatedTuple_eval]
+    | Not φ ih =>
+      simp[Selection.eval,Selection.castToAnnotatedTuple]
+      rw[ih]
+    | And φ₁ φ₂ ih₁ ih₂ =>
+      simp[Selection.eval,Selection.castToAnnotatedTuple]
+      rw[ih₁,ih₂]
+    | Or φ₁ φ₂ ih₁ ih₂ =>
+      simp[Selection.eval,Selection.castToAnnotatedTuple]
+      rw[ih₁,ih₂]
+    | True => trivial
+
+@[reducible] def Selection.evalDecidable (φ : Selection T n) : DecidablePred φ.eval :=
+  λ t => match φ with
+    | Selection.BT φ      => φ.evalDecidable t
+    | Selection.Not φ     => match φ.evalDecidable t with
+      | isTrue h  => isFalse (by simp [Selection.eval, h])
+      | isFalse h => isTrue  (by simp [Selection.eval, h])
+    | Selection.And φ₁ φ₂  => match φ₁.evalDecidable t, φ₂.evalDecidable t with
+      | isTrue h₁, isTrue h₂   => isTrue  (by simp [Selection.eval, h₁, h₂])
+      | isFalse h, _ | _, isFalse h => isFalse (by simp [Selection.eval, h])
+    | Selection.Or φ₁ φ₂   => match φ₁.evalDecidable t, φ₂.evalDecidable t with
+      | isTrue h, _ | _, isTrue h => isTrue (by simp [Selection.eval, h])
+      | isFalse h₁, isFalse h₂    => isFalse (by simp [Selection.eval, h₁, h₂])
+    | Selection.True       => isTrue (rfl)
+
+instance : Coe (BoolTerm T n) (Selection T n) where
+  coe bt := Selection.BT bt
+
+/-- Addition as a binary function, the fold of the `⊕`-sum performed by
+the rewriting-target operator `Query.ProvSum` (and by its general-syntax
+counterpart `AggQuery.ProvSum`). -/
+def addFn (a b : T) := a + b
+instance : @Std.Commutative T addFn where
+  comm := add_comm
+instance : @Std.Associative T addFn where
+  assoc := add_assoc
+
+/-- An aggregate function on *sequences* of values: an arbitrary function
+from finite sequences over `T` to `T`. Beyond the monoid-shaped `⊕`-sum
+of `Query.ProvSum`, this interface covers non-commutative aggregates –
+such as `PICKFIRST`, whose result depends on the order of its input – and
+non-associative ones. It is the aggregate interface of the fused `Having`
+operator, whose possible-world semantics does not need any algebraic
+structure on the aggregate. -/
+def SeqAggFunc (T : Type) := List T → T
+
+namespace SeqAggFunc
+
+/-- `SUM` as a sequence aggregate. -/
+def sum : SeqAggFunc T := fun L => L.foldr (· + ·) 0
+
+/-- `COUNT(*)` as a sequence aggregate (over an `ℕ`-valued domain). -/
+def count : SeqAggFunc ℕ := List.length
+
+/-- `MIN`, with value `0` on the empty sequence (the possible-world
+semantics only ever applies it to non-empty sequences). -/
+def minD : SeqAggFunc T := fun L => match L with
+  | [] => 0
+  | x :: xs => xs.foldr min x
+
+/-- `MAX`, with value `0` on the empty sequence. -/
+def maxD : SeqAggFunc T := fun L => match L with
+  | [] => 0
+  | x :: xs => xs.foldr max x
+
+/-- `PICKFIRST`: the first value of the sequence, `0` if empty. -/
+def pickFirst : SeqAggFunc T := fun L => L.headD 0
+
+end SeqAggFunc
+
+inductive Query (T: Type) : ℕ → Type
+| Rel   : (n: ℕ) → String → Query T n
+| Proj  : Tuple (Term T n) m → Query T n → Query T m
+| Sel   : Selection T n → Query T n → Query T n
+| Prod {hn: n₁+n₂=n} : Query T n₁ → Query T n₂ → Query T n
+| Sum   : Query T n → Query T n → Query T n
+| Dedup : Query T n → Query T n
+| Diff  : Query T n → Query T n → Query T n
+/-- Provenance aggregation: group by the key columns of the first
+argument and `⊕`-sum the term of the second over each group into a single
+trailing output column. It is not a *source* operator – aggregation as
+such lives on the general syntax (`AggQuery.Gamma`) – but the *target* of
+the (R1)–(R4) rewriting: the ⊕-gate creation of the `ε` and `∖` rules of
+`Query.rewriting`. Its general-syntax counterpart is
+`AggQuery.ProvSum`. -/
+| ProvSum   : Tuple (Fin m) n₁ → Term T m → Query T m → Query T (n₁+1)
+/-- The fused `HAVING` operator: grouping by the indices of the first
+argument, computing the sequence aggregates of the third argument applied
+to the terms of the second (each group read in the canonical tuple order,
+which plays the role of the ordering `≼` of non-commutative aggregates),
+and keeping only the groups whose aggregate value in column `l` (the
+`Fin n₂` argument) compares, via the comparison operator, with the value of
+the regular term (the `Term T n₁` argument, evaluated on the group key –
+this covers both query constants and group-key attributes). The output has
+the group key followed by the aggregate values. -/
+| Having    : Tuple (Fin m) n₁ → Tuple (Term T m) n₂ → Tuple (SeqAggFunc T) n₂ →
+    CompOp → Fin n₂ → Term T n₁ → Query T m → Query T (n₁+n₂)
+
+def Query.repr [Repr T] : Query T n → ℕ → Std.Format
+| Rel _ s, p => s
+| Proj ts q, p => "Π_" ++ (Repr.addAppParen (ts.repr p) p) ++ (Repr.addAppParen (q.repr p) p)
+| Sel φ q, p => "σ_" ++ (Repr.addAppParen (φ.repr p) p) ++ (Repr.addAppParen (q.repr p) p)
+| Prod q₁ q₂, p => Repr.addAppParen (q₁.repr p ++ "×" ++ q₂.repr p) p
+| Sum q₁ q₂, p => Repr.addAppParen (q₁.repr p ++ "⊎" ++ q₂.repr p) p
+| Dedup q, p => "ε" ++ Repr.addAppParen (q.repr p) p
+| Diff q₁ q₂, p => Repr.addAppParen (q₁.repr p ++ "-" ++ q₂.repr p) p
+| ProvSum is t q, p =>
+  "γ⊕_" ++ (Repr.addAppParen (is.repr p) p)
+    ++ (Repr.addAppParen (t.repr p) p)
+    ++ (Repr.addAppParen (q.repr p) p)
+| Having is ts _ op l s q, p =>
+  "γHaving_" ++ (Repr.addAppParen (is.repr p) p)
+    ++ (Repr.addAppParen (ts.repr p) p)
+    ++ "[#" ++ (reprArg l) ++ (reprArg op) ++ (Repr.addAppParen (s.repr p) p) ++ "]"
+    ++ (Repr.addAppParen (q.repr p) p)
+
+instance [Repr α] : Repr (Query α n) := ⟨Query.repr⟩
+
+/-- The **source fragment** of the classical syntax: the operators a
+query is *written* with, RA⁺(∖). It excludes the two operators that are
+not source operators – `ProvSum`, which the (R1)–(R4) rewriting *emits*,
+and the fused `Having`, whose semantics lives on the general syntax – and
+is exactly the fragment carrying an annotated semantics
+(`Query.evaluateAnnotated`) and accepted by `Query.rewriting`. Its
+general-syntax counterpart is `AggQuery.classical`. -/
+def Query.source (q: Query T n): Prop := match q with
+| Rel   n  s  => True
+| Proj  _ q   => q.source
+| Sel   _  q  => q.source
+| Prod  q₁ q₂ => q₁.source ∧ q₂.source
+| Sum   q₁ q₂ => q₁.source ∧ q₂.source
+| Dedup q     => q.source
+| Diff  q₁ q₂ => q₁.source ∧ q₂.source
+| ProvSum _ _ q => False
+| Having _ _ _ _ _ _ _ => False
+
+@[reducible] def Query.sourceDecidable {T: Type} {n: ℕ}: DecidablePred (@Query.source T n):=
+  fun (q: Query T n) => match q with
+  | Rel n s => isTrue (by simp[source])
+  | Proj  _ q'   => match q'.sourceDecidable with
+    | isTrue h => isTrue (by simp[source]; exact h)
+    | isFalse h => isFalse (by simp[source]; exact h)
+  | Sel   _  q'  => match q'.sourceDecidable with
+    | isTrue h => isTrue (by simp[source]; exact h)
+    | isFalse h => isFalse (by simp[source]; exact h)
+  | Prod  q₁ q₂ => match q₁.sourceDecidable, q₂.sourceDecidable with
+    | isTrue h₁,  isTrue h₂  => isTrue (by simp[source]; exact ⟨h₁,h₂⟩)
+    | isFalse h₁, _          => isFalse (by simp[source]; simp[h₁])
+    | _,          isFalse h₂ => isFalse (by simp[source]; simp[h₂])
+  | Sum   q₁ q₂ => match q₁.sourceDecidable, q₂.sourceDecidable with
+    | isTrue h₁,  isTrue h₂  => isTrue (by simp[source]; exact ⟨h₁,h₂⟩)
+    | isFalse h₁, _          => isFalse (by simp[source]; simp[h₁])
+    | _,          isFalse h₂ => isFalse (by simp[source]; simp[h₂])
+  | Dedup q'     => match q'.sourceDecidable with
+    | isTrue h => isTrue (by simp[source]; exact h)
+    | isFalse h => isFalse (by simp[source]; exact h)
+  | Diff  q₁ q₂ => match q₁.sourceDecidable, q₂.sourceDecidable with
+    | isTrue h₁,  isTrue h₂  => isTrue (by simp[source]; exact ⟨h₁,h₂⟩)
+    | isFalse h₁, _          => isFalse (by simp[source]; simp[h₁])
+    | _,          isFalse h₂ => isFalse (by simp[source]; simp[h₂])
+  | ProvSum _ _ q' => isFalse (by simp[source])
+  | Having _ _ _ _ _ _ _ => isFalse (by simp[source])
+
+instance {T: Type} {n: ℕ} : DecidablePred (@Query.source T n) := Query.sourceDecidable
+
+set_option linter.unusedSectionVars false
+@[simp]
+theorem Query.sourceProd {q: Query T n} :
+  q.source → ∀ {n₁} {q₁: Query T n₁} {q₂: Query T n₂} {hn: n₁+n₂=n}
+    (_: q = @Prod T n₁ n₂ n hn q₁ q₂), q₁.source ∧ q₂.source  := by
+    intro hna n₁ q₁ q₂ hn₁ hq
+    unfold source at hna
+    simp[hq] at hna
+    assumption
+
+@[simp]
+theorem Query.sourceSum {q: Query T n} :
+  q.source → ∀ {q₁: Query T n} {q₂: Query T n} (_: q = Sum q₁ q₂), q₁.source ∧ q₂.source  := by
+    intro hna q₁ q₂ hq
+    unfold source at hna
+    simp[hq] at hna
+    assumption
+
+@[simp]
+theorem Query.sourceDiff {q: Query T n} :
+  q.source → ∀ {q₁: Query T n} {q₂: Query T n} (_: q = Diff q₁ q₂), q₁.source ∧ q₂.source  := by
+    intro hna q₁ q₂ hq
+    unfold source at hna
+    simp[hq] at hna
+    assumption
+
+@[simp]
+theorem Query.sourceProj {q: Query T n} :
+  q.source → ∀ {m} {t} {q': Query T m} (_: q = Proj t q'), q'.source := by
+    intro hna m t q' hq
+    unfold source at hna
+    rw[hq] at hna
+    assumption
+
+@[simp]
+theorem Query.sourceSel {q: Query T n} :
+  q.source → ∀ {φ} {q': Query T n} (_: q = Sel φ q'), q'.source := by
+    intro hna φ q' hq
+    unfold source at hna
+    rw[hq] at hna
+    assumption
+
+@[simp]
+theorem Query.sourceDedup {q: Query T n} :
+  q.source → ∀ {q': Query T n} (_: q = Dedup q'), q'.source := by
+    intro hna q' hq
+    unfold source at hna
+    rw[hq] at hna
+    assumption
+
+prefix:max "Π " => Query.Proj
+prefix:max "σ " => Query.Sel
+infix:80 " × " => Query.Prod
+infix:50 " ⊎ " => Query.Sum
+prefix:max "ε " => Query.Dedup
+infix:50 " - " => Query.Diff
+infix:1020 " ⋈ " => λ q₁ φ ↦ λ q₂ ↦ (σ φ) (q₁ × q₂)
+infix:50 " ∪ " => λ q₁ q₂ ↦ ε (q₁ ⊎ q₂)
+
+def Query.arity (_: Query T n) := n
+
+def Query.aggdepth2_plus_depth (q: Query T n) : ℕ := match q with
+| Rel   n  s  => 0
+| Proj  _ q   => let d := q.aggdepth2_plus_depth; d+1
+| Sel   _  q  => let d := q.aggdepth2_plus_depth; d+1
+| Prod  q₁ q₂ =>
+  let d₁ := q₁.aggdepth2_plus_depth
+  let d₂ := q₂.aggdepth2_plus_depth
+  (max d₁ d₂)+1
+| Sum   q₁ q₂ =>
+  let d₁ := q₁.aggdepth2_plus_depth
+  let d₂ := q₂.aggdepth2_plus_depth
+  (max d₁ d₂)+1
+| Dedup q     => let d := q.aggdepth2_plus_depth; d+1
+| Diff  q₁ q₂ =>
+  let d₁ := q₁.aggdepth2_plus_depth
+  let d₂ := q₂.aggdepth2_plus_depth
+  (max d₁ d₂)+1
+| ProvSum _ _ q => let d := q.aggdepth2_plus_depth; (d+3)
+| Having _ _ _ _ _ _ q => let d := q.aggdepth2_plus_depth; (d+3)
+
+/-- The occurrences of the group of key `g` in relation `r`: the multiset of
+matching tuples, as a list sorted by the canonical linear order on tuples.
+The sort order plays the role of the ordering `≼` along which
+non-commutative sequence aggregates read the occurrences of a group; for
+commutative aggregates it is irrelevant. -/
+def Relation.groupSeq (is : Tuple (Fin m) n₁) (r : Relation T m) (g : Tuple T n₁) :
+    List (Tuple T m) :=
+  Multiset.sort (Multiset.filter (fun u => ∀ k' : Fin n₁, u (is k') = g k') r) (· ≤ ·)
+
+/-- Standard multiset semantics of a query over a plain database.
+
+The `Diff` case is *all-or-nothing* difference: every copy of a tuple that
+occurs at all in `r₂` is removed from `r₁` (deliberately not `Multiset.sub`,
+which would subtract multiplicities as in SQL's `EXCEPT ALL`). This matches
+the monus-based annotated semantics of difference
+(`Query.evaluateAnnotated`) exactly on `0`/`1`-annotated inputs; on general
+annotations the two disagree over `ℕ` (see `Nat.counterexample_diff_adequacy`
+and `Provenance.QueryAdequacy`). -/
+def Query.evaluate (q: Query T n) (d: Database T): Relation T n := match q with
+| Rel   n  s  =>
+  match d.find n s with
+  | none => (∅: Multiset (Tuple T n))
+  | some rn => rn
+| Proj ts q => let r := evaluate q d; Multiset.map (λ t ↦ λ k ↦ (ts k).eval t) r
+| Sel   φ  q  => let r := evaluate q d; @Multiset.filter _ φ.eval φ.evalDecidable r
+| @Prod _ n₁ n₂ n hn q₁ q₂ =>
+  let r₁ := evaluate q₁ d
+  let r₂ := evaluate q₂ d
+  (r₁ * r₂).cast hn
+| Sum   q₁ q₂ => let r₁ := evaluate q₁ d; let r₂ := evaluate q₂ d; r₁ + r₂
+| Dedup q     => let r := evaluate q d; Multiset.dedup r
+| Diff  q₁ q₂ =>
+  let r₁ := evaluate q₁ d
+  let r₂ : Multiset (Tuple T _) := evaluate q₂ d
+  r₁.filter (fun t ↦ t ∉ r₂)
+| @ProvSum _ m n₁ is t q =>
+    let r := evaluate ε (Π (λ (k: Fin n₁) ↦ #(is k)) q) d
+    let s := evaluate q d
+    r.map (λ g ↦ Fin.append g (
+      λ _: Fin 1 ↦ (
+        (s.filter (λ u ↦ ∀ k': Fin n₁, u (is k') = g k')).map (λ u ↦ t.eval u)
+      ).fold addFn 0
+    ))
+| @Having _ m n₁ n₂ is ts fs op l s q =>
+    let keys := evaluate ε (Π (λ (k: Fin n₁) ↦ #(is k)) q) d
+    let r := evaluate q d
+    Multiset.map
+      (λ g ↦ Fin.append g
+        (λ (k: Fin n₂) ↦ (fs k) ((Relation.groupSeq is r g).map (ts k).eval)))
+      (Multiset.filter
+        (λ g ↦ op.eval ((fs l) ((Relation.groupSeq is r g).map (ts l).eval)) (s.eval g))
+        keys)
+termination_by q.aggdepth2_plus_depth
+decreasing_by
+  all_goals simp[aggdepth2_plus_depth]
+  any_goals refine Nat.lt_add_one_of_le ?_
+  any_goals exact Nat.le_max_left _ _
+  any_goals exact Nat.le_max_right _ _

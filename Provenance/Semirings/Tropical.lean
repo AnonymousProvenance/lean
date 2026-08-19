@@ -4,6 +4,7 @@ import Mathlib.Data.Real.Basic
 import Mathlib.Tactic.Linarith
 
 import Provenance.Having
+import Provenance.HavingMinMax
 import Provenance.SemiringWithMonus
 import Provenance.Semirings.BoolFunc
 
@@ -45,7 +46,7 @@ theorem tropical_order_ge [LinearOrder α] :
     intro a b
     exact Tropical.add_eq_right_iff.symm
 
-/-- the indicator of being nonzero. -/
+/-- The δ operator of the tropical semiring: the indicator of being nonzero. -/
 private noncomputable def Tropical.deltaInd
     [LinearOrderedAddCommMonoidWithTop α] (a : Tropical α) : Tropical α :=
   if a = 0 then 0 else 1
@@ -135,7 +136,6 @@ noncomputable instance [LinearOrderedAddCommMonoidWithTop α] : SemiringWithMonu
     split_ifs with h
     . simp
       left
-      simp at h
       exact h
     . simp at h
       apply Iff.intro
@@ -149,13 +149,15 @@ noncomputable instance [LinearOrderedAddCommMonoidWithTop α] : SemiringWithMonu
         | inr h'' =>
           exact h''
 
-  /- δ matches the support indicator
+  /- δ is the support indicator
   (`0 = trop ⊤ ↦ 0`, any other element ↦ `1 = trop 0`).
-  The tropical semiring is idempotent, so a tropical `δ` could equally well be the
-  identity;
+  The tropical semiring is additively idempotent, so `δ := id` does satisfy
+  `delta_zero` and `delta_natCast_pos`, but it fails `delta_absorb`, whose
+  content here is `a + min(a, b) = a` in the underlying monoid – see
+  `TropicalN.not_isDelta_id`. The indicator is therefore forced.
 
   The proofs below are local rather than going through the generic helpers
-  `delta_natCast_pos_indicator` / `delta_regrouping_indicator`: the tropical order
+  `delta_natCast_pos_indicator` / `delta_absorb_indicator`: the tropical order
   that makes the semiring canonically ordered is the *reverse* of the Mathlib order on
   `Tropical α`, so we cannot expose a separate `CanonicallyOrderedAdd (Tropical α)`
   instance without clashing with `Mathlib.Algebra.Tropical.Basic`. -/
@@ -171,57 +173,16 @@ noncomputable instance [LinearOrderedAddCommMonoidWithTop α] : SemiringWithMonu
     split_ifs with hh
     · exact hh.symm
     · rfl
-  delta_regrouping := by
-    -- `Tropical α` analogue of `Multiset.sum_eq_zero_iff` (Mathlib only provides the
-    -- canonically-ordered version, but the tropical order here is reversed). Proved
-    -- by induction: zero in the tropical semiring is `trop ⊤`, addition is `min`,
-    -- and `min x y = ⊤ ↔ x = ⊤ ∧ y = ⊤`.
-    have hsum_zero : ∀ (t : Multiset (Tropical α)),
-        t.sum = 0 ↔ ∀ a ∈ t, a = 0 := by
-      intro t
-      induction t using Multiset.induction_on with
-      | empty => simp
-      | cons a r ih =>
-        rw [Multiset.sum_cons]
-        simp only [Multiset.mem_cons, forall_eq_or_imp]
-        constructor
-        · intro hadd
-          have h : min (Tropical.untrop a) (Tropical.untrop r.sum) = ⊤ := by
-            rw [← Tropical.untrop_add, hadd, Tropical.untrop_zero]
-          refine ⟨Tropical.untrop_injective ?_, ih.mp (Tropical.untrop_injective ?_)⟩
-          · rw [Tropical.untrop_zero]
-            exact le_antisymm le_top (by rw [← h]; exact min_le_left _ _)
-          · rw [Tropical.untrop_zero]
-            exact le_antisymm le_top (by rw [← h]; exact min_le_right _ _)
-        · rintro ⟨ha, hr⟩
-          rw [ha, ih.mpr hr, add_zero]
-    intro s
-    show Tropical.deltaInd (s.map Tropical.deltaInd).sum = Tropical.deltaInd s.sum
-    -- Both sides reduce to a single `if`; show the conditions coincide.
-    have hzero_iff : (s.map Tropical.deltaInd).sum = 0 ↔ s.sum = 0 := by
-      constructor
-      · intro h
-        refine (hsum_zero s).mpr (fun a ha => ?_)
-        by_contra hane
-        have h1eq : (1 : Tropical α) = 0 := by
-          have hmem : (1 : Tropical α) ∈ s.map Tropical.deltaInd :=
-            Multiset.mem_map.mpr ⟨a, ha, by simp [Tropical.deltaInd, hane]⟩
-          exact (hsum_zero _).mp h _ hmem
-        -- `1 = 0` in a semiring collapses everything to `0`.
-        apply hane
-        calc a = a * 1 := (mul_one a).symm
-          _ = a * 0 := by rw [h1eq]
-          _ = 0 := mul_zero a
-      · intro h
-        refine (hsum_zero _).mpr ?_
-        intro b hb
-        obtain ⟨a, ha, rfl⟩ := Multiset.mem_map.mp hb
-        simp [Tropical.deltaInd, (hsum_zero s).mp h a ha]
-    show (if (s.map Tropical.deltaInd).sum = 0 then (0 : Tropical α) else 1) =
-         if s.sum = 0 then (0 : Tropical α) else 1
-    by_cases hs : s.sum = 0
-    · rw [if_pos hs, if_pos (hzero_iff.mpr hs)]
-    · rw [if_neg hs, if_neg (fun h => hs (hzero_iff.mp h))]
+  delta_absorb := fun a b => by
+    by_cases h : a + b = 0
+    · have hmin : min (Tropical.untrop a) (Tropical.untrop b) = ⊤ := by
+        rw [← Tropical.untrop_add, h, Tropical.untrop_zero]
+      have ha : a = 0 := Tropical.untrop_injective (by
+        rw [Tropical.untrop_zero]
+        exact le_antisymm le_top (by rw [← hmin]; exact min_le_left _ _))
+      rw [ha, zero_mul]
+    · show a * Tropical.deltaInd (a + b) = a
+      rw [Tropical.deltaInd, if_neg h, mul_one]
 
 noncomputable instance [LinearOrderedAddCommMonoidWithTop α] :
     CommSemiringWithMonus (Tropical α) where
@@ -233,6 +194,15 @@ noncomputable instance : CommSemiringWithMonus (Tropical (WithTop ℕ)) := infer
 /-- The tropical semiring over `ℚ ∪ {∞}` is a semiring with monus. -/
 noncomputable instance : SemiringWithMonus (Tropical (WithTop ℚ)) := inferInstance
 noncomputable instance : CommSemiringWithMonus (Tropical (WithTop ℚ)) := inferInstance
+
+/-- The tropical semiring over `ℤ ∪ {∞}` is a semiring with monus. Like
+the `ℚ` and `ℝ` variants it is idempotent and `⊗`-over-`⊖` distributive
+but not absorptive; unlike them its carrier is kernel-computable, which
+makes it the tropical semiring of choice for `decide`-checked
+counterexamples. -/
+noncomputable instance : SemiringWithMonus (Tropical (WithTop ℤ)) := inferInstance
+noncomputable instance : CommSemiringWithMonus (Tropical (WithTop ℤ)) := inferInstance
+instance : HasAltLinearOrder (Tropical (WithTop ℤ)) := ⟨inferInstance⟩
 
 /-- The tropical semiring over `ℝ ∪ {∞}` is a semiring with monus. Note
 that this contradicts [Geerts & Poggi, *On database query languages for
@@ -252,6 +222,20 @@ theorem Tropical.absorptive [LinearOrderedAddCommMonoidWithTop α] [CanonicallyO
 
 theorem TropicalN.absorptive : absorptive (Tropical (WithTop ℕ)) := by
   exact Tropical.absorptive
+
+/-- On the tropical semiring over `ℕ ∪ {∞}` the identity is not an admissible `δ`,
+even though this semiring *is* absorptive (`TropicalN.absorptive`): what
+`delta_absorb` asks of `δ := id` is the lattice law `a ⊗ (a ⊕ b) = a`, i.e.,
+`a + min(a, b) = a` in `ℕ`, and at `a = b = trop 1` it reads `trop 2 ≠ trop 1`.
+This is why the instance takes the support indicator. -/
+theorem TropicalN.not_isDelta_id :
+    ¬ IsDelta (id : Tropical (WithTop ℕ) → Tropical (WithTop ℕ)) := by
+  refine not_isDelta_id_of_absorb_ne
+    (a := Tropical.trop ((1 : ℕ) : WithTop ℕ))
+    (b := Tropical.trop ((1 : ℕ) : WithTop ℕ)) ?_
+  intro h
+  have h' := congrArg Tropical.untrop h
+  simp [Tropical.untrop_mul] at h'
 
 /-- Times distributes over monus on tropical semirings made of an order
   strictly compatible with addition, with an additional top element. -/
@@ -330,8 +314,8 @@ Unlike `Tropical (WithTop ℕ)` (canonically ordered, hence absorptive via
 `a = trop (-1)` we have `1 + a = trop (min 0 (-1)) = trop (-1) ≠ trop 0 = 1`.
 
 The tropical m-semiring over `ℝ` is still idempotent and satisfies
-`mul_sub_left_distributive`, so it satisfies the "idempotent + ⊗-over-⊖
-distributive" hypotheses one might hope to suffice for `Having.F_eq_S`.
+`mul_sub_left_distributive`, so it satisfies the “idempotent + ⊗-over-⊖
+distributive” hypotheses one might hope to suffice for `Having.F_eq_S`.
 The witness below shows that the strengthened hypothesis (absorptivity) is
 genuinely required: on `U = {true, false} ⊆ Bool` and `α ≡ trop (-1)` we
 have `S_1(U) = trop (-1)` but `F_1(U) = trop (-2)`. -/
@@ -394,7 +378,7 @@ private theorem neg1_ge_neg2 :
     ((-1 : ℝ) : WithTop ℝ) ≥ ((-2 : ℝ) : WithTop ℝ) := by
   exact_mod_cast (by norm_num : (-1 : ℝ) ≥ -2)
 
-/-- The "exactly-`{b}`" contribution vanishes for both singletons: the
+/-- The “exactly-`{b}`” contribution vanishes for both singletons: the
 monus `trop (-1) ⊖ trop (-2)` collapses to `0` because `-1 ≥ -2` puts
 `trop (-2)` above `trop (-1)` in the natural (reverse) order. -/
 private theorem T_ce_singleton_eq_zero (b : Bool) :
@@ -414,8 +398,10 @@ private theorem T_ce_singleton_eq_zero (b : Bool) :
   show (if Tropical.untrop (Tropical.trop ((-1 : ℝ) : WithTop ℝ)) ≥
            Tropical.untrop (Tropical.trop ((-2 : ℝ) : WithTop ℝ)) then
         (⊤ : Tropical (WithTop ℝ)) else _) = 0
-  simp only [Tropical.untrop_trop]
-  rw [if_pos neg1_ge_neg2]
+  have hge : Tropical.untrop (Tropical.trop ((-1 : ℝ) : WithTop ℝ)) ≥
+      Tropical.untrop (Tropical.trop ((-2 : ℝ) : WithTop ℝ)) := by
+    simpa using neg1_ge_neg2
+  rw [if_pos hge]
   rfl
 
 /-- The maximal subset contributes `trop (-2)`: with `U \ {true, false} = ∅`,
@@ -471,7 +457,7 @@ fails in `Tropical (WithTop ℝ)`: with `U = Finset.univ : Finset Bool`,
 `α ≡ trop (-1)`, and `C = 1`, we have `F_1(U) = trop (-2)` while
 `S_1(U) = trop (-1)`. This shows that `Having.F_eq_S` genuinely needs the
 absorptivity hypothesis (cf. `TropicalR.not_absorptive`): the weaker
-"idempotent + `mul_sub_left_distributive`" combination satisfied by
+“idempotent + `mul_sub_left_distributive`” combination satisfied by
 `Tropical (WithTop ℝ)` (and likewise by `Tropical (WithTop ℚ)`) is insufficient. -/
 theorem TropicalR.F_ne_S :
     Having.F TropicalR.α_ce (Finset.univ : Finset Bool) 1 ≠
@@ -479,3 +465,63 @@ theorem TropicalR.F_ne_S :
   rw [TropicalR.F_ce_univ_one, TropicalR.S_ce_univ_one]
   intro h
   exact absurd (WithTop.coe_injective (Tropical.trop_injective h)) (by norm_num)
+
+namespace TropicalR
+
+/-- Counterexample aggregate term: the constant `t ≡ 0` on `Bool`. -/
+private noncomputable def t_ce : Bool → ℝ := fun _ => 0
+
+/-- On the counterexample instance, the possible-world provenance of
+`MIN(t) ≥ 0` sums over all non-empty worlds (the predicate holds
+everywhere since `t ≡ 0`), so it coincides with `F_1(U) = trop (-2)`. -/
+private theorem prov_min_ge_ce :
+    Having.prov α_ce (Finset.univ : Finset Bool)
+        (fun W => CompOp.ge.eval (Having.minAgg t_ce W) (((0 : ℝ) : WithTop ℝ)))
+      = Tropical.trop ((-2 : ℝ) : WithTop ℝ) := by
+  rw [← F_ce_univ_one]
+  show ∑ W ∈ _, _ = ∑ W ∈ _, _
+  refine Finset.sum_congr (Finset.filter_congr fun W _ => ?_) fun _ _ => rfl
+  have hP : CompOp.ge.eval (Having.minAgg t_ce W) (((0 : ℝ) : WithTop ℝ)) := by
+    show ((0 : ℝ) : WithTop ℝ) ≤ Having.minAgg t_ce W
+    rw [Having.le_minAgg_iff]
+    intro i _
+    simp [t_ce]
+  rw [Finset.one_le_card]
+  exact ⟨fun h => h.1, fun h => ⟨h, hP⟩⟩
+
+/-- On the counterexample instance, the `MIN` scan for `≥` returns
+`trop (-1)`: no occurrence has value `< 0`, so the scan degenerates to
+`𝟙 ⊗ (α true ⊕ α false) = trop (-1) ⊕ trop (-1) = trop (-1)`. -/
+private theorem minScan_ge_ce :
+    Having.minScan α_ce (Finset.univ : Finset Bool) t_ce CompOp.ge (0 : ℝ)
+      = Tropical.trop ((-1 : ℝ) : WithTop ℝ) := by
+  show (1 - ∑ x ∈ Finset.univ.filter (fun i => t_ce i < 0), α_ce x)
+      * ∑ i ∈ Finset.univ.filter (fun i => (0 : ℝ) ≤ t_ce i), α_ce i = _
+  have h₁ : (Finset.univ : Finset Bool).filter (fun i => t_ce i < 0) = ∅ :=
+    Finset.filter_false_of_mem (fun i _ => by simp [t_ce])
+  have h₂ : (Finset.univ : Finset Bool).filter (fun i => (0 : ℝ) ≤ t_ce i)
+      = Finset.univ :=
+    Finset.filter_true_of_mem (fun i _ => by simp [t_ce])
+  rw [h₁, h₂, Finset.sum_empty, monus_zero, one_mul,
+    show (Finset.univ : Finset Bool) = ({true, false} : Finset Bool) from by decide,
+    Finset.sum_pair (by decide : true ≠ false)]
+  exact Tropical.idempotent _
+
+/-- The `MIN`-scan collapse (`Having.minScan_correct`) fails in
+`Tropical (WithTop ℝ)`: on `U = {true, false}` with `α ≡ trop (-1)`,
+`t ≡ 0` and the predicate `MIN(t) ≥ 0`, the possible-world provenance is
+`trop (-2)` while the scan returns `trop (-1)`. This is the same instance
+as `TropicalR.F_ne_S`, and shows that the absorptivity hypothesis of
+`Having.minScan_correct` (and, by symmetry, of `Having.maxScan_correct`
+and `Having.firstScan_correct`) is genuinely required: the weaker
+“idempotent + `mul_sub_left_distributive`” combination satisfied by
+`Tropical (WithTop ℝ)` is insufficient. -/
+theorem minScan_ne_prov :
+    Having.prov α_ce (Finset.univ : Finset Bool)
+        (fun W => CompOp.ge.eval (Having.minAgg t_ce W) (((0 : ℝ) : WithTop ℝ)))
+      ≠ Having.minScan α_ce (Finset.univ : Finset Bool) t_ce CompOp.ge (0 : ℝ) := by
+  rw [prov_min_ge_ce, minScan_ge_ce]
+  intro h
+  exact absurd (WithTop.coe_injective (Tropical.trop_injective h)) (by norm_num)
+
+end TropicalR

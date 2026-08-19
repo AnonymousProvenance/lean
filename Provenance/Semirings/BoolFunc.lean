@@ -13,11 +13,14 @@ is `f ≤ g ↔ ∀ a, f a → g a` (pointwise implication).
 `BoolFunc X` is absorptive, idempotent, and left-distributive.
 
 This semiring is used in
-[Green, Karvounarakis & Tannen, *Provenance Semirings*][green2007provenance].
+[Green, Karvounarakis & Tannen, *Provenance Semirings*][green2007provenance] and
+surveyed in [*Provenance and Probabilities in Relational
+Databases*][senellart2017provenance].
 
 ## References
 
 * [Green, Karvounarakis & Tannen, *Provenance Semirings*][green2007provenance]
+* [*Provenance and Probabilities in Relational Databases*][senellart2017provenance]
 -/
 
 /-- The type of Boolean functions over Boolean assignments to `X`:
@@ -159,14 +162,19 @@ instance : SemiringWithMonus (BoolFunc X) where
       simp[hb] at h'
       exact h'
 
-  /- δ matches the identity. -/
+  /- δ is the identity. -/
   delta := id
   delta_zero := rfl
   delta_natCast_pos :=
     let hidem : idempotent (BoolFunc X) :=
       idempotent_of_absorptive (fun a => by simp [(· + ·), Add.add]; congr)
     fun hn => delta_natCast_pos_id hidem hn
-  delta_regrouping := delta_regrouping_id
+  delta_absorb := fun a b => funext fun ν => by
+    show (a ν && (a ν || b ν)) = a ν
+    cases a ν <;> cases b ν <;> rfl
+
+/-- On `𝔹[X]` the identity is an admissible `δ`, so it is the one used. -/
+theorem BoolFunc.isDelta_id : IsDelta (id : BoolFunc X → BoolFunc X) := isDelta_delta
 
 instance : CommSemiringWithMonus (BoolFunc X) where
   mul_comm := mul_comm

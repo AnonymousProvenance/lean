@@ -48,6 +48,10 @@ set inclusion.
 * `SemiringWithMonus (IntervalUnion (WithBot (WithTop ℚ)))` – interval unions over the
   extended rationals
 
+## References
+
+* [Widiaatmaja et al., *Demonstration of ProvSQL Update
+  Provenance through Temporal Databases*][widiaatmaja2025demonstration]
 -/
 
 /-- A finite union of pairwise-disjoint intervals sorted from left to right.
@@ -152,7 +156,8 @@ theorem ext_toSet [LinearOrder α] [DenselyOrdered α]
           -- y in I.toSet or L ∈ tl
           cases List.mem_cons.mp hLconsI with
           | inr hLtl =>
-            -- y ∈ L.toSet with I.before L → I.hi.val ≤ L.lo.val ≤ y ≤ J.hi.val and x ≤ I.hi.val but x ≥ K.lo.val > J.hi.val
+            -- y ∈ L.toSet with I.before L → I.hi.val ≤ L.lo.val ≤ y ≤ J.hi.val
+            -- and x ≤ I.hi.val but x ≥ K.lo.val > J.hi.val
             have hIbL := (List.pairwise_cons.mp hpb₁).1 L hLtl
             -- I.hi.val ≤ L.lo.val
             have hIhiLlo : I.hi.val ≤ L.lo.val := by
@@ -1364,7 +1369,7 @@ instance [DenselyOrdered α] [BoundedOrder α]: SemiringWithMonus (IntervalUnion
       · exact absurd hxb hxnb
       · exact hxc
 
-  /- δ matches the identity. -/
+  /- δ is the identity. -/
   delta := id
   delta_zero := rfl
   delta_natCast_pos :=
@@ -1373,7 +1378,17 @@ instance [DenselyOrdered α] [BoundedOrder α]: SemiringWithMonus (IntervalUnion
       rw [add_eq_union, mem_union]
       simp [one_toSet]
     fun hn => delta_natCast_pos_id (idempotent_of_absorptive habs) hn
-  delta_regrouping := delta_regrouping_id
+  delta_absorb := fun a b => by
+    apply ext_toSet
+    ext x
+    rw [mul_eq_inter, add_eq_union]
+    rw [mem_inter, id_eq, mem_union]
+    tauto
+
+/-- On interval unions the identity is an admissible `δ`, so it is the one used;
+`delta_absorb` is `A ∩ (A ∪ B) = A`. -/
+theorem IntervalUnion.isDelta_id [DenselyOrdered α] [BoundedOrder α] :
+    IsDelta (id : IntervalUnion α → IntervalUnion α) := isDelta_delta
 
 instance [DenselyOrdered α] [BoundedOrder α] : CommSemiringWithMonus (IntervalUnion α) where
   mul_comm := mul_comm
@@ -1434,7 +1449,7 @@ with `f σ = true` and `var_i^true = var_i`, `var_i^false = 1 - var_i`. Define
 `atomIU ν σ := ∏_i (if σ i then ν i else 1 - ν i)`. This is a finite Boolean
 combination of the `ν(i)`'s, hence lies in `IntervalUnion β`.
 
-The correctness rests on the set-theoretic characterisation
+The correctness rests on the set-theoretic characterization
 `mem_atomIU_iff_sig`: `x ∈ (atomIU ν σ).toSet` iff `σ` is the ν-signature of
 `x`, where the ν-signature `sigOf ν x` sends each `i` to `decide (x ∈ ν i)`.
 This yields `(evalBF ν f).toSet = {x : β | f (sigOf ν x) = true}`
@@ -1530,12 +1545,12 @@ the set of `x : β` such that `f` holds on `x`'s ν-signature. -/
 private noncomputable def evalBF (ν : Y → IntervalUnion β) (f : BoolFunc Y) : IntervalUnion β :=
   ∑ σ : Y → Bool, if f σ then atomIU ν σ else 0
 
-/-- toSet characterisation of `evalBF`. -/
+/-- toSet characterization of `evalBF`. -/
 private lemma evalBF_toSet (ν : Y → IntervalUnion β) (f : BoolFunc Y) :
     (evalBF ν f).toSet = {x : β | f (sigOf ν x) = true} := by
   rw [evalBF, sum_toSet]
   ext x
-  simp only [Set.mem_iUnion, Set.mem_setOf_eq]
+  simp only [Set.mem_iUnion, Set.mem_ofPred_eq]
   constructor
   · rintro ⟨σ, _, hxσ⟩
     by_cases hfσ : f σ = true
@@ -1552,7 +1567,7 @@ private lemma evalBF_zero (ν : Y → IntervalUnion β) : evalBF ν 0 = 0 := by
   apply ext_toSet
   rw [evalBF_toSet, zero_toSet]
   ext x
-  simp only [Set.mem_setOf_eq, Set.mem_empty_iff_false, iff_false]
+  simp only [Set.mem_ofPred_eq, Set.mem_empty_iff_false, iff_false]
   show ¬ (false = true)
   decide
 
@@ -1561,7 +1576,7 @@ private lemma evalBF_one (ν : Y → IntervalUnion β) : evalBF ν 1 = 1 := by
   apply ext_toSet
   rw [evalBF_toSet, one_toSet]
   ext x
-  simp only [Set.mem_setOf_eq, Set.mem_univ, iff_true]
+  simp only [Set.mem_ofPred_eq, Set.mem_univ, iff_true]
   rfl
 
 /-- `evalBF` preserves addition. -/
@@ -1570,7 +1585,7 @@ private lemma evalBF_add (ν : Y → IntervalUnion β) (f g : BoolFunc Y) :
   apply ext_toSet
   rw [add_toSet, evalBF_toSet, evalBF_toSet, evalBF_toSet]
   ext x
-  simp only [Set.mem_setOf_eq, Set.mem_union]
+  simp only [Set.mem_ofPred_eq, Set.mem_union]
   show ((f (sigOf ν x)) || (g (sigOf ν x))) = true ↔ _
   simp [Bool.or_eq_true]
 
@@ -1580,7 +1595,7 @@ private lemma evalBF_mul (ν : Y → IntervalUnion β) (f g : BoolFunc Y) :
   apply ext_toSet
   rw [mul_toSet, evalBF_toSet, evalBF_toSet, evalBF_toSet]
   ext x
-  simp only [Set.mem_setOf_eq, Set.mem_inter_iff]
+  simp only [Set.mem_ofPred_eq, Set.mem_inter_iff]
   show ((f (sigOf ν x)) && (g (sigOf ν x))) = true ↔ _
   simp [Bool.and_eq_true]
 
@@ -1590,7 +1605,7 @@ private lemma evalBF_sub (ν : Y → IntervalUnion β) (f g : BoolFunc Y) :
   apply ext_toSet
   rw [sub_toSet, evalBF_toSet, evalBF_toSet, evalBF_toSet]
   ext x
-  simp only [Set.mem_setOf_eq, Set.mem_diff]
+  simp only [Set.mem_ofPred_eq, Set.mem_sdiff]
   show ((f (sigOf ν x)) && !(g (sigOf ν x))) = true ↔ _
   rw [Bool.and_eq_true]
   refine and_congr_right (fun _ => ?_)
@@ -1602,7 +1617,7 @@ private lemma evalBF_var (ν : Y → IntervalUnion β) (i : Y) :
   apply ext_toSet
   rw [evalBF_toSet]
   ext x
-  simp only [Set.mem_setOf_eq]
+  simp only [Set.mem_ofPred_eq]
   show sigOf ν x i = true ↔ _
   rw [sigOf, Bool.decide_iff]
 
@@ -1633,7 +1648,7 @@ theorem IntervalUnion.homomorphism_from_BoolFunc
   intro i
   exact evalBF_var ν i
 
-/-- Specialisation of `IntervalUnion.homomorphism_from_BoolFunc` to the
+/-- Specialization of `IntervalUnion.homomorphism_from_BoolFunc` to the
 extended rationals. -/
 theorem IntervalUnion.homomorphism_from_BoolFunc_rat
     (Y : Type) [Fintype Y] [DecidableEq Y] :

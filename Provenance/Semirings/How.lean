@@ -1,6 +1,5 @@
 import Mathlib.Algebra.MvPolynomial.Basic
 import Mathlib.Algebra.MvPolynomial.Eval
-import Mathlib.Data.Finsupp.ToDFinsupp
 
 import Provenance.SemiringWithMonus
 import Provenance.Semirings.BoolFunc
@@ -27,7 +26,8 @@ differences*, Table on p. 4][amsterdamer2011limitations].
 
 * [Green, Karnouvarakis & Tannen, *Provenance Semirings*][green2007provenance]
 * [Geerts & Poggi, *On database query languages for K-relations*][geerts2010database]
-* [Amsterdamer, Deutch & Tannen, *On the limitations of provenance for queries with differences*][amsterdamer2011limitations]
+* [Amsterdamer, Deutch & Tannen, *On the limitations of provenance for queries
+  with differences*][amsterdamer2011limitations]
 -/
 
 variable {X: Type} [DecidableEq X]
@@ -36,18 +36,15 @@ instance : LE (MvPolynomial X ℕ) where
   le a b := ∀ m, a.coeff m ≤ b.coeff m
 
 
-instance : Sub (MvPolynomial X ℕ) where
+noncomputable instance : Sub (MvPolynomial X ℕ) where
   sub a b :=
-    let aDF := a.toDFinsupp
-    let bDF := b.toDFinsupp
-    let rDF := DFinsupp.zipWith (λ m x y ↦ x - y) (by simp) aDF bDF
-    rDF.toFinsupp
+    .ofCoeff (Finsupp.zipWith (· - ·) (by simp)
+      (AddMonoidAlgebra.coeff a) (AddMonoidAlgebra.coeff b))
 
 
+omit [DecidableEq X] in
 theorem coeff_sub (p q : MvPolynomial X ℕ) (n : X →₀ ℕ) :
-  (p-q).coeff n = p.coeff n - q.coeff n := by
-    simp only[HSub.hSub, Sub.sub]
-    simp [MvPolynomial.coeff, DFinsupp.toFinsupp, DFinsupp.zipWith]
+  (p-q).coeff n = p.coeff n - q.coeff n := rfl
 
 
 instance : PartialOrder (MvPolynomial X ℕ) where
@@ -76,7 +73,8 @@ instance : IsOrderedAddMonoid (MvPolynomial X ℕ) where
 instance : CanonicallyOrderedAdd (MvPolynomial X ℕ) where
   exists_add_of_le := by
     intro a b hab
-    use Finsupp.zipWith (· - ·) (by simp) b a
+    use .ofCoeff (Finsupp.zipWith (· - ·) (by simp)
+      (AddMonoidAlgebra.coeff b) (AddMonoidAlgebra.coeff a))
     ext m
     exact (Nat.sub_eq_iff_eq_add' (hab m)).mp rfl
 
@@ -98,7 +96,7 @@ instance : CharZero (MvPolynomial X ℕ) where
     rwa [← MvPolynomial.C_eq_coe_nat, ← MvPolynomial.C_eq_coe_nat,
          MvPolynomial.C_inj, Nat.cast_inj] at hxy
 
-/-- the support indicator. -/
+/-- The δ operator of `ℕ[X]`: the support indicator. -/
 private noncomputable def How.deltaInd (p : MvPolynomial X ℕ) : MvPolynomial X ℕ :=
   if p = 0 then 0 else 1
 
@@ -110,8 +108,8 @@ private theorem How.deltaInd_isIndicator : IsDeltaIndicator (How.deltaInd (X := 
 `CommutativeSemiring` is done in a non-computable way in Mathlib. We
 could redefine `MvPolynomial` to provide computable proofs.
 
-The δ operator matches the support indicator
-(`0 ↦ 0`, any non-zero polynomial ↦ `1`). -/
+The δ operator is the support indicator (`0 ↦ 0`, any non-zero
+polynomial ↦ `1`). -/
 noncomputable instance : SemiringWithMonus (MvPolynomial X ℕ) where
   monus_spec := by
     intro a b c
@@ -123,7 +121,7 @@ noncomputable instance : SemiringWithMonus (MvPolynomial X ℕ) where
   delta := How.deltaInd
   delta_zero := How.deltaInd_isIndicator.zero
   delta_natCast_pos := delta_natCast_pos_indicator How.deltaInd_isIndicator
-  delta_regrouping := delta_regrouping_indicator How.deltaInd_isIndicator
+  delta_absorb := delta_absorb_indicator How.deltaInd_isIndicator
 
 noncomputable instance : CommSemiringWithMonus (MvPolynomial X ℕ) where
   mul_comm := mul_comm
@@ -140,6 +138,14 @@ theorem How.not_absorptive : ¬(absorptive (MvPolynomial X ℕ)) := by
   have h₂ : ¬(idempotent (MvPolynomial X ℕ)) := How.not_idempotent
   tauto
 
+
+omit [DecidableEq X] in
+/-- On `ℕ[X]` the identity is not an admissible `δ`: `δ(𝟙 ⊕ 𝟙) = 𝟙` would make
+the semiring idempotent, and `ℕ[X]` counts (`1 + 1 = 2 ≠ 1`). This is why the
+instance above takes the support indicator. -/
+theorem How.not_isDelta_id :
+    ¬ IsDelta (id : MvPolynomial X ℕ → MvPolynomial X ℕ) :=
+  not_isDelta_id_of_not_idempotent How.not_idempotent
 
 omit [DecidableEq X] in
 /-- The How[X] semiring is universal among commutative semirings. This

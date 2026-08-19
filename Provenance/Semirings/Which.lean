@@ -178,10 +178,12 @@ instance : CanonicallyOrderedAdd (Which α) where
   le_self_add := by
     intro a b
     cases a <;> cases b <;> simp [(· ≤ ·)]
+    exact fun _ h => Or.inl h
 
   le_add_self := by
     intro a b
     cases a <;> cases b <;> simp [(· ≤ ·)]
+    exact fun _ h => Or.inr h
 
 instance : IsOrderedAddMonoid (Which α) where
   add_le_add_left := by
@@ -189,16 +191,44 @@ instance : IsOrderedAddMonoid (Which α) where
     simp[(· + ·),Add.add,(· ≤ ·)]
     cases a <;> cases b <;> intro h c <;> cases c <;> simp <;> simp at h
     . rename_i x y z
-      exact Finset.union_subset_union_left h
+      exact fun _ hx => hx.imp (fun hxx => h hxx) id
     . assumption
+    . exact fun _ hx => Or.inr hx
 
   add_le_add_right := by
     intro a b
     simp[(· + ·),Add.add,(· ≤ ·)]
     cases a <;> cases b <;> intro h c <;> cases c <;> simp <;> simp at h
     . rename_i x y z
-      exact Finset.union_subset_union_right h
+      exact fun _ hx => hx.imp id (fun hxx => h hxx)
     . assumption
+    . exact fun _ hx => Or.inl hx
+
+/-- The support-indicator `δ` of which-provenance: `⊥` on `⊥`, the empty
+label set (`𝟙`) otherwise. The identity choice violates `delta_absorb` –
+`Which` is not absorptive,
+`⊗` and `⊕` both being union. -/
+private def Which.deltaInd : Which α → Which α
+  | .wbot => .wbot
+  | .wset _ => .wset ∅
+
+omit [DecidableEq α] in
+private lemma Which.deltaInd_of_ne {a : Which α} (h : a ≠ 0) :
+    Which.deltaInd a = 1 := by
+  cases a with
+  | wbot => exact absurd rfl h
+  | wset sa => rfl
+
+private lemma Which.zsf {a b : Which α} (h : a + b = 0) : a = 0 := by
+  cases a with
+  | wbot => rfl
+  | wset sa => cases b <;> exact absurd h (by simp [(· + ·), Add.add])
+
+omit [DecidableEq α] in
+private lemma Which.one_ne_zero' : (1 : Which α) ≠ 0 := by
+  intro h
+  have h' : Which.wset (∅ : Finset α) = Which.wbot := h
+  simp at h'
 
 instance : SemiringWithMonus (Which α) where
   monus_spec := by
@@ -206,36 +236,41 @@ instance : SemiringWithMonus (Which α) where
     simp[(· + ·),Add.add,(· - ·),Sub.sub,(· ≤ ·)]
     cases ha : a <;> rename_i sa <;> cases hb : b <;> cases hc : c <;> simp
     . rename_i sb sc
-      by_cases h' : sa ⊆ sb <;> simp[h']
-      . intro x hx
-        exact Finset.mem_union_left sc (h' hx)
-      . apply Iff.intro
+      by_cases h' : ∀ ⦃x : α⦄, x ∈ sa → x ∈ sb
+      . rw [if_pos h']
+        exact iff_of_true trivial fun x hx => Or.inl (h' hx)
+      . rw [if_neg h']
+        constructor
         . intro h₁ x hx
           by_cases hxb : x ∈ sb
-          . exact Finset.mem_union_left sc hxb
-          . simp[hxb]
-            have hx₁ : x ∈ sa \ sb := by
-              simp[hx,hxb]
-            exact h₁ hx₁
+          . exact Or.inl hxb
+          . exact Or.inr (h₁ (Finset.mem_sdiff.mpr ⟨hx, hxb⟩))
         . intro h₁ x hx
-          simp at hx
-          have hx₁ : x ∈ sa := by
-            simp[hx]
-          have : x ∈ sb ∪ sc := h₁ hx₁
-          simp[hx] at this
-          assumption
+          rcases h₁ (Finset.mem_sdiff.mp hx).1 with hb | hc
+          . exact absurd hb (Finset.mem_sdiff.mp hx).2
+          . exact hc
     . rename_i sb
-      by_cases h' : sa ⊆ sb <;> simp[h']
+      by_cases h' : ∀ ⦃x : α⦄, x ∈ sa → x ∈ sb
+      . rw [if_pos h']
+        exact iff_of_true trivial fun x hx => h' hx
+      . rw [if_neg h']
+        exact iff_of_false id fun hf => h' hf
 
-  /- δ matches the identity. -/
-  delta := id
+  /- δ is the support indicator (see `Which.deltaInd`). -/
+  delta := Which.deltaInd
   delta_zero := rfl
   delta_natCast_pos :=
     let hidem : idempotent (Which α) := fun a => by
       simp [(· + ·), Add.add]
       cases ha: a <;> simp
-    fun hn => delta_natCast_pos_id hidem hn
-  delta_regrouping := delta_regrouping_id
+    fun hn => by
+      rw [natCast_pos_eq_one_of_idempotent hidem hn,
+        Which.deltaInd_of_ne Which.one_ne_zero']
+  delta_absorb := fun a b => by
+    by_cases ha : a = 0
+    · rw [ha, zero_mul]
+    · have habne : a + b ≠ 0 := fun h => ha (Which.zsf h)
+      rw [Which.deltaInd_of_ne habne, mul_one]
 
 instance : CommSemiringWithMonus (Which α) where
   mul_comm := mul_comm
@@ -251,6 +286,14 @@ theorem Which.not_absorptive (h: ∃ (_: α), ⊤) : ¬(absorptive (Which α)) :
     rfl
   rw[← this]
   simp
+
+/-- On Lin[X] with a non-empty label set, the identity is not an admissible
+`δ`: `delta_absorb` at `a = 𝟙` is absorptivity, which Lin[X] lacks (`⊗` and
+`⊕` both being union). This is why the instance takes the support indicator
+rather than the identity. -/
+theorem Which.not_isDelta_id (h : ∃ (_ : α), ⊤) :
+    ¬ IsDelta (id : Which α → Which α) :=
+  not_isDelta_id_of_not_absorptive (Which.not_absorptive h)
 
 /-- Which[∅] is absorptive -/
 theorem Which.absorptive (h: IsEmpty α): absorptive (Which α) := by

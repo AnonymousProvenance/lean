@@ -1,4 +1,5 @@
 import Provenance.SemiringWithMonus
+import Provenance.Semirings.Bool
 import Provenance.Semirings.BoolFunc
 
 /-!
@@ -12,7 +13,7 @@ The natural order is the usual order on natural numbers, and monus coincides wit
 Mathlib's `Nat.sub`.
 -/
 
-/-- the support indicator. -/
+/-- The δ operator of the counting semiring: the support indicator. -/
 private def Nat.deltaInd (n : ℕ) : ℕ := if n = 0 then 0 else 1
 
 private theorem Nat.deltaInd_isIndicator : IsDeltaIndicator Nat.deltaInd where
@@ -20,7 +21,7 @@ private theorem Nat.deltaInd_isIndicator : IsDeltaIndicator Nat.deltaInd where
   nonzero := fun a ha => by simp [Nat.deltaInd, ha]
 
 /-- `ℕ` is a commutative m-semiring. The natural order is the usual order on
-natural numbers, and the monus is truncated subtraction. The δ operator matches
+natural numbers, and the monus is truncated subtraction. The δ operator is
 the support indicator (`0 ↦ 0`, positive ↦ `1`). -/
 instance : SemiringWithMonus Nat where
   monus_spec := by
@@ -56,7 +57,7 @@ instance : SemiringWithMonus Nat where
   delta := Nat.deltaInd
   delta_zero := Nat.deltaInd_isIndicator.zero
   delta_natCast_pos := delta_natCast_pos_indicator Nat.deltaInd_isIndicator
-  delta_regrouping := delta_regrouping_indicator Nat.deltaInd_isIndicator
+  delta_absorb := delta_absorb_indicator Nat.deltaInd_isIndicator
 
 instance : CommSemiringWithMonus Nat where
   mul_comm := mul_comm
@@ -76,6 +77,12 @@ theorem Nat.not_absorptive : ¬ (absorptive Nat) := by
   by_contra h
   exact Nat.not_idempotent (idempotent_of_absorptive h)
 
+/-- On `ℕ` the identity is not an admissible `δ`: `δ(𝟙 ⊕ 𝟙) = 𝟙` would make
+`ℕ` idempotent (`1 + 1 = 2 ≠ 1`). This is why the instance above takes the
+support indicator. -/
+theorem Nat.not_isDelta_id : ¬ IsDelta (id : ℕ → ℕ) :=
+  not_isDelta_id_of_not_idempotent Nat.not_idempotent
+
 /-- `ℕ` has characteristic 0: it satisfies `CharZero`, hence `CharP ℕ 0` via
 `CharP.ofCharZero`. -/
 theorem Nat.charP_zero : CharP Nat 0 := inferInstance
@@ -87,14 +94,34 @@ theorem Nat.no_hom_from_BoolFunc {X : Type} [Inhabited X] :
     ∃ ν : X → ℕ, ¬ ∃ φ : BoolFunc X →+* ℕ, ∀ i : X, φ (BoolFunc.var i) = ν i :=
   BoolFunc.no_hom_of_not_absorptive Nat.not_absorptive
 
-/-- Over `ℕ`, the two natural expansions of `HAVING (count = 2)` for a
+/-- There is no m-semiring homomorphism from `ℕ` to `𝔹`. The unique *ring*
+homomorphism `ℕ → 𝔹` is the support map `n ↦ (n ≠ 0)` (the natural-number
+cast), but it does not preserve monus: `supp (2 ∸ 1) = ⊤` while
+`supp 2 ∸ supp 1 = ⊥`. This is the algebraic form of the fact that
+`ℕ`-adequacy of the annotated semantics stops at the monotone fragment:
+possible-worlds equalities transfer along monus-preserving homomorphisms
+into `𝔹` (as they exist for `BoolFunc X`, one per valuation), and `ℕ` has
+none. -/
+theorem Nat.no_monusHom_to_Bool : IsEmpty (SemiringWithMonusHom ℕ Bool) := by
+  constructor
+  intro h
+  have h2 : h.toRingHom 2 = 1 := by
+    have h11 : (2:ℕ) = 1 + 1 := rfl
+    rw [h11, RingHom.map_add, RingHom.map_one]
+    decide
+  have hsub := h.map_sub 2 1
+  rw [show (2:ℕ) - 1 = 1 from rfl, RingHom.map_one, h2] at hsub
+  exact absurd hsub (by decide)
+
+/-- Over `ℕ`, the fused `HAVING (COUNT(*) = 2)` predicate provenance of a
 three-tuple group, `(t₁ ⊗ t₂) ⊗ (𝟙 ⊖ t₃) ⊕ (t₁ ⊗ t₃) ⊗ (𝟙 ⊖ t₂) ⊕
-(t₂ ⊗ t₃) ⊗ (𝟙 ⊖ t₁)` and `(t₁ ⊗ t₂) ⊕ (t₁ ⊗ t₃) ⊕ (t₂ ⊗ t₃)`, differ.
-With `t₁ = t₂ = t₃ = 1`, the first expression evaluates to `0` while the
-second evaluates to `3`. -/
+(t₂ ⊗ t₃) ⊗ (𝟙 ⊖ t₁)`, differs from the annotation
+`((t₁ ⊗ t₂) ⊕ (t₁ ⊗ t₃) ⊕ (t₂ ⊗ t₃)) ⊖ (t₁ ⊗ t₂ ⊗ t₃)` produced by the
+join-based rewriting `Q₂^{≥2} − Q₂^{≥3}`. With `t₁ = t₂ = t₃ = 1`, the
+first expression evaluates to `0` while the second evaluates to `2`. -/
 theorem Nat.counterexample_having :
     let t₁ : ℕ := 1
     let t₂ : ℕ := 1
     let t₃ : ℕ := 1
     (t₁ * t₂) * (1 - t₃) + (t₁ * t₃) * (1 - t₂) + (t₂ * t₃) * (1 - t₁)
-      ≠ t₁ * t₂ + t₁ * t₃ + t₂ * t₃ := by decide
+      ≠ (t₁ * t₂ + t₁ * t₃ + t₂ * t₃) - t₁ * t₂ * t₃ := by decide

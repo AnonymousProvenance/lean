@@ -16,11 +16,13 @@ The Łukasiewicz semiring is absorptive and idempotent, and satisfies left-distr
 of multiplication over monus.
 
 This semiring is discussed as a provenance semiring in
-[Grädel & Tannen, *Provenance Analysis and Semiring Semantics for First-Order Logic*][gradel2005provenance].
+[Grädel & Tannen, *Provenance Analysis and Semiring Semantics for First-Order
+Logic*][gradel2005provenance].
 
 ## References
 
-* [Grädel & Tannen, *Provenance Analysis and Semiring Semantics for First-Order Logic*][gradel2005provenance]
+* [Grädel & Tannen, *Provenance Analysis and Semiring Semantics for First-Order
+  Logic*][gradel2005provenance]
 -/
 
 /-- The Łukasiewicz semiring: rationals in `[0,1]` with `max` as addition and the
@@ -109,8 +111,7 @@ instance : CommSemiring Lukasiewicz where
     have ha := a.property.left
     simp
     apply eq_of_le_of_ge
-    . simp
-      exact Bool.le_of_eq ha
+    . exact Bool.le_of_eq ha
     . simp
 
   add_zero := by
@@ -119,8 +120,7 @@ instance : CommSemiring Lukasiewicz where
     have ha := a.property.left
     simp
     apply eq_of_le_of_ge
-    . simp
-      exact Bool.le_of_eq ha
+    . exact Bool.le_of_eq ha
     . simp
 
   mul_assoc := by
@@ -299,7 +299,7 @@ nontrivial, so every positive natural-number cast equals `1`. -/
 instance Lukasiewicz.instCharPZero : CharP Lukasiewicz 0 :=
   CharP.zero_of_idempotent Lukasiewicz.idempotent
 
-/-- the support indicator. -/
+/-- The δ operator of `Lukasiewicz`: the support indicator. -/
 private def Lukasiewicz.deltaInd (a : Lukasiewicz) : Lukasiewicz :=
   if a = 0 then 0 else 1
 
@@ -308,8 +308,8 @@ private theorem Lukasiewicz.deltaInd_isIndicator : IsDeltaIndicator Lukasiewicz.
   nonzero := fun a ha => by simp [Lukasiewicz.deltaInd, ha]
 
 /-- `Lukasiewicz` is a commutative m-semiring. The natural order is the usual rational
-order, and the monus is `a` if `a > b`, `0` if `a ≤ b`. The δ operator matches's
-`Lukasiewicz::delta`: the support indicator. -/
+order, and the monus is `a` if `a > b`, `0` if `a ≤ b`. The δ operator is the
+support indicator. -/
 instance : SemiringWithMonus Lukasiewicz where
   monus_spec := by
     intro a b c
@@ -331,7 +331,7 @@ instance : SemiringWithMonus Lukasiewicz where
   delta := Lukasiewicz.deltaInd
   delta_zero := Lukasiewicz.deltaInd_isIndicator.zero
   delta_natCast_pos := delta_natCast_pos_indicator Lukasiewicz.deltaInd_isIndicator
-  delta_regrouping := delta_regrouping_indicator Lukasiewicz.deltaInd_isIndicator
+  delta_absorb := delta_absorb_indicator Lukasiewicz.deltaInd_isIndicator
 
 instance : CommSemiringWithMonus Lukasiewicz where
   mul_comm := mul_comm
@@ -353,6 +353,15 @@ theorem Lukasiewicz.not_mul_idempotent : ¬ ∀ a : Lukasiewicz, a * a = a := by
   have hpos : (0 : ℚ) < (2 : ℚ)⁻¹ := by
     rw [inv_pos]; norm_num
   exact hpos.ne h'
+
+/-- On the Łukasiewicz semiring the identity is not an admissible `δ`, even though
+the semiring is absorptive (`Lukasiewicz.absorptive`): what `delta_absorb` asks of
+`δ := id` is the lattice law `a ⊗ (a ⊕ b) = a`, which at `a = b = 1/2` reads
+`1/2 ⊗ 1/2 = max(0, 0) = 0 ≠ 1/2`. This is why the instance takes the support
+indicator. -/
+theorem Lukasiewicz.not_isDelta_id : ¬ IsDelta (id : Lukasiewicz → Lukasiewicz) :=
+  not_isDelta_id_of_not_mul_idempotent Lukasiewicz.idempotent
+    Lukasiewicz.not_mul_idempotent
 
 /-- There is no semiring homomorphism from `BoolFunc Y` to the Łukasiewicz
 semiring sending the variables to arbitrary values: Łukasiewicz multiplication
